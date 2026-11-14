@@ -1,17 +1,21 @@
 # Virtual Software Team
 
-**Give it one sentence. Get back a designed, coded, tested, reviewed and documented Python program.**
+**Describe what you want in one sentence. Get back a designed, coded, tested, stress-tested, reviewed and documented Python program.**
 
 Virtual Software Team is a pipeline of AI agents that work like a small
-software company. You describe an idea ("a command-line budget tracker"), and
-the team turns it into a working project: requirements, a design, the code,
-a test suite, a code review and a README. The tests are actually run, and
-failures are fed back to the agents until the code passes or the retry budget
-runs out.
+software company. You give it a plain-English idea, and the team decides
+everything else: the requirements, the design, the code, the tests, the
+handling of bad input, the review and the README. Nothing needs to be spelled
+out. The finished program is run, attacked with hostile input, and sent back for
+fixes until it holds up or the retry budget runs out.
 
 ```
-python virtual_team.py "a command-line unit converter" --out ./unit_converter
+python virtual_team.py "a bank account manager"
 ```
+
+That is the whole interface. The output goes into its own folder,
+`team_output/a_bank_account_manager`, so earlier projects are never overwritten.
+Run it with no idea at all and it asks you what to build.
 
 It runs on free options: local models through [Ollama](https://ollama.com), or
 any hosted OpenAI-compatible API (for example Groq).
@@ -20,26 +24,28 @@ any hosted OpenAI-compatible API (for example Groq).
 
 ## How it works
 
-Every agent is the same thing: a **role** (a system prompt) plus a call to the
-model. What makes them a team is the workflow around them and the checks that
-keep their output honest.
+Every agent is a **role** (a system prompt) plus a call to the model. All of
+them start with the same short team charter, so each one knows the whole
+pipeline, what its own job is, and what the finished program must guarantee:
+no traceback shown to the user, no lost data, and no nonsense such as `nan` or
+`inf`.
 
 ```
-Idea
+Idea (one sentence)
  |
  v
-PM -----------> short requirements list (max 6 bullets)
+PM -----------> short requirements list (max 6 bullets), filling in any
+ |              details the user did not give
+ v
+Architect ----> DESIGN.md: signatures, data structures, rules, error
+ |              handling, worked examples, example session
+ v
+DesignReview -> checks the design against the idea
  |
  v
-Architect ----> DESIGN.md: signatures, data structures, rules,
- |              worked examples, example session
- v
-DesignReview -> reviewer checks the design against the idea
- |
- v
-Verifier -----> writes a script that re-derives every worked example
- |              from the design's own rules and runs it
- |              (mismatches go back to the Architect, up to 2 rounds)
+Verifier -----> writes a script that re-derives every worked example from
+ |              the design's own rules and runs it; mismatches go back to
+ |              the Architect (up to 2 rounds)
  v
 Developer ----> app.py
  |
@@ -47,41 +53,64 @@ Developer ----> app.py
 Tester -------> test_app.py (unittest), built from the worked examples
  |
  v
-Run the tests  <------------------------------+
- |                                            |
- |-- tests fail --> Developer fixes code      |
- |                  (or Tester fixes a broken |
- |                  test file) ---------------+
- |
- |-- tests pass --> Reviewer
-                      |-- APPROVED -----------> Docs writes README.md
-                      |-- CHANGES NEEDED -----> back to Developer
+ +--> Run the tests ----- fail --> Developer fixes the code
+ |                                (or Tester fixes a broken test file)
+ |        | pass
+ |        v
+ |    Stress test ------- crash, hang or nan --> Developer fixes the code
+ |        | survives
+ |        v
+ |    Reviewer ---------- CHANGES NEEDED -----> Developer fixes the code
+ |        | APPROVED
+ +--------+ (loops back until done or out of rounds)
+          v
+        Docs -------> README.md
 ```
 
 ### The agents
 
 | Agent | Job |
 |---|---|
-| **PM** | Turns the idea into a short requirements list for a small, single-file, standard-library-only program. Keeps the scope small. |
-| **Architect** | Writes the design for `app.py`: exact function signatures, one flat lookup table, formulas, which inputs raise which errors, 5-8 worked examples, and an example session. Rejects `nan` and `inf`, and decides what empty input does. |
+| **PM** | Turns the one-sentence idea into a short requirements list for a small, single-file, standard-library-only program, including how invalid input and stored data are handled. |
+| **Architect** | Writes the design for `app.py`: exact signatures, one flat lookup table, formulas, which inputs raise which errors, 5-8 worked examples and an example session. Rules covered: money uses `Decimal`, `nan` and `inf` are rejected, errors go to stderr for command-line programs, input can end early, and saved data is written safely and a corrupted file is backed up. |
 | **DesignReview** | Checks the design against the original idea: features nobody asked for, examples that contradict the rules, hard cases with no example, inputs that parse but crash later. Replies `OK` or lists problems. |
-| **Verifier** | Independently re-implements the design's rules in a script and checks every worked example and every stated count or total. Mismatches between the rules and the examples are sent back to the Architect. |
-| **Developer** | Writes the complete `app.py` following the design exactly. Also fixes the code when tests fail or the reviewer asks for changes. |
-| **Tester** | Writes `test_app.py` with `unittest` from the design's worked examples, including an end-to-end test of `main()`. Tests are deterministic, use temp files, and never touch the network or your real files. |
-| **Reviewer** | A strict code review for correctness, security and clarity. Replies `APPROVED` or `CHANGES NEEDED` with up to 5 problems. |
+| **Verifier** | Independently re-implements the design's rules in a script and checks every worked example and every stated count or total. Mismatches go back to the Architect. |
+| **Developer** | Writes the complete `app.py` following the design exactly, wraps `main()` so end of input and Ctrl+C end cleanly, and fixes the code when tests, the stress test or the reviewer find problems. |
+| **Tester** | Writes `test_app.py` with `unittest` from the worked examples, including an end-to-end test of `main()` and a test for every invalid-input rule. Tests are deterministic, use temp files, and never touch the network or real files. |
+| **Reviewer** | A strict code review. Checks in particular for tracebacks reachable from user input, float used for money, accepted `nan` or `inf`, data that could be lost or corrupted, and unhandled end of input. Replies `APPROVED` or `CHANGES NEEDED`. |
 | **Docs** | Writes the final `README.md` for the generated program, using only facts that are in the code. |
 
-### Safeguards built into the pipeline
+### The stress test
 
-- **Design is verified before any code is written.** The Verifier catches arithmetic mistakes and contradictions in the examples early, when they are cheap to fix.
-- **A fix can never make things worse.** If a round reduces the number of passing tests, the code is reverted to the best version seen so far.
-- **Fixes are sanity-checked.** A proposed fix is rejected if it is not valid Python or if it drops a function the tests use.
-- **Test bugs and code bugs are routed separately.** A `NameError` or bad import inside the test file goes to the Tester, everything else goes to the Developer.
-- **Repeated failures change tactics.** If a fix produces the exact same failure, the Developer is told to rewrite the failing part with a different approach.
+After the tests pass, the team attacks the finished program with hostile input.
+This step is plain code with no model involved, so every finding is a real
+crash, not a guess. It runs `app.py` in an empty sandbox with a throwaway home
+folder, so it can never touch your real files.
+
+It tries:
+- no input at all, and only blank lines
+- `nan`, `inf`, `-inf`, `1e999`, `0`, negatives, text instead of numbers
+- empty and whitespace-only values, a 400-digit number, accented and symbol characters
+- `--help`, `1/0`, `None`, `[]` and a SQL-injection string
+- every value above as an input line and as a command-line argument
+- each command word it finds in the code (like `deposit` or `add`), alone and followed by each hostile value
+
+It reports a **traceback**, a program that **hangs** past 5 seconds, and a
+program that **prints `nan` or `inf` as a result**. The real traceback is sent
+to the Developer, who must fix it. If the program cannot be fixed within the
+round limit, the generated README starts with a warning saying so.
+
+### Other safeguards
+
+- **The design is verified before any code is written**, when mistakes are cheap to fix.
+- **A fix can never make things worse.** If a round reduces the passing tests, the code is reverted to the best version seen.
+- **Fixes are sanity-checked.** A fix is rejected if it is not valid Python or drops a function the tests use.
+- **Test bugs and code bugs are routed separately.** A `NameError` inside the test file goes to the Tester, everything else goes to the Developer.
+- **Repeated failures change tactics.** If a fix produces the exact same failure, the Developer is told to take a different approach.
 - **Missing imports in tests are added automatically** (`sys`, `io`, `contextlib`, `unittest.mock`).
-- **Optional Docker sandbox.** Set `TEAM_USE_DOCKER=1` to run the generated tests in a container with no network and 512 MB of memory.
-- **Every step is committed** to a local git repository inside the output folder, so you can see how the project evolved.
-- **Honest output.** If the code never passed its tests or review, the generated README starts with a warning saying so.
+- **Optional Docker sandbox.** `TEAM_USE_DOCKER=1` runs the tests and the stress test in a container with no network and 512 MB of memory.
+- **Every step is committed** to a local git repository inside the output folder.
+- **Honest output.** If the program never passed, its README opens with a warning.
 
 ---
 
@@ -128,21 +157,20 @@ TEAM_MODEL=your-model-name
 
 ```
 python virtual_team.py "a command-line to-do list manager"
-python virtual_team.py "a to-do list manager" --out ./my_project
-python virtual_team.py "a unit converter" --design DESIGN.md --out ./my_project
+python virtual_team.py                                   (asks what to build)
+python virtual_team.py "a unit converter" --out ./converter
 python virtual_team.py "a password generator" --pause-after-design
+python virtual_team.py "a unit converter" --design DESIGN.md
 ```
 
 | Option | What it does |
 |---|---|
-| `idea` | The idea in plain English (required). |
-| `--out FOLDER` | Where to write the project (default `./team_output`). |
+| `idea` | The idea in plain English. If left out, the team asks for it. |
+| `--out FOLDER` | Where to write the project. Default: `team_output/<name made from the idea>`, with `_2`, `_3`... added if that folder is already used. |
 | `--design FILE` | Skip the PM, Architect and review. Build from a design file you wrote or edited. |
 | `--pause-after-design` | Stop after the design so you can check the worked examples and edit `DESIGN.md` before any code is written. |
 
 ### What you get
-
-The output folder contains:
 
 | File | Contents |
 |---|---|
@@ -152,7 +180,7 @@ The output folder contains:
 | `README.md` | Documentation for the generated program. |
 | `last_test_output.txt` | Output of the most recent test run. |
 | `DESIGN_CHECK.txt` | Mismatches the Verifier found (only if there were any). |
-| `REVIEW_NOTES.md` | Reviewer suggestions that could not be applied (only if that happened). |
+| `REVIEW_NOTES.md` | Requested changes that could not be applied (only if that happened). |
 | `.git/` | One commit per step of the build. |
 
 ---
@@ -168,7 +196,8 @@ All settings are environment variables. They can live in `.env`.
 | `TEAM_API_BASE` | *(empty)* | Base URL of a hosted OpenAI-compatible API. If set, Ollama is not used. |
 | `TEAM_API_KEY` | *(empty)* | Key for that provider. |
 | `TEAM_MAX_ROUNDS` | `5` | Maximum fix/review rounds. |
-| `TEAM_USE_DOCKER` | `0` | `1` runs generated tests in Docker with no network. |
+| `TEAM_STRESS` | `1` | `0` turns the stress test off. |
+| `TEAM_USE_DOCKER` | `0` | `1` runs generated code in Docker with no network. |
 | `TEAM_NUM_CTX` | Ollama default | Context window in tokens for Ollama. Set to `8192` for long designs. |
 | `TEAM_MAX_TOKENS` | provider default | Maximum tokens per reply for hosted APIs. |
 | `TEAM_REQUEST_LIMIT` | `6500` | Approximate maximum tokens per request to a hosted API. Longer "continue" requests are shrunk. `0` never shrinks. |
@@ -193,37 +222,11 @@ Each idea below went through the full pipeline.
 | `tip_app` | Tip calculator: bill, tip percent and number of people on the command line. |
 | `todo_app` | Command-line task manager that stores tasks in a JSON file. |
 | `password_app` | Password tool. |
-| `expenses` | Expense tracker. |
-| `habit` | Habit tracker. |
+| `expenses_app` | Expense tracker. |
+| `habit_app2` | Habit tracker. |
 
 The `*_design.md` files in the repository are the designs these projects were
 built from. They can be fed back in with `--design`.
-
-### Extra human-written test suites
-
-The generated tests cover the design. To check that the agents' output holds up
-in practice, some projects also have independent test suites written by hand:
-
-- `tip_app2/test_app.py`: 27 edge cases (`inf`, `nan`, negatives, zero people, huge numbers, bad arguments, rounding). Errors must go to stderr with a non-zero exit code and no traceback.
-- `todo_app2/test_todo.py`: 33 tests covering every command, bad input, a corrupted data file and timestamp format. It runs against a temporary home folder, so the real `~/.todo.json` is never touched.
-
-Run them from inside the project folder with `python test_app.py` or
-`python test_todo.py`.
-
----
-
-## Testing the team itself
-
-The goal is to find where the agents break, so ideas get harder in steps. Each
-level adds something the previous one did not need.
-
-1. **Level 1: single-function programs.** Tip calculator, unit converter.
-2. **Level 2: programs with state.** To-do list with a JSON file, habit tracker.
-3. **Level 3 and above:** to be added as the agents are pushed harder.
-
-For each run, record whether the team finished with `APPROVED`, how many rounds
-it needed, and which of the independent edge-case tests the generated code
-failed.
 
 ---
 
@@ -231,7 +234,8 @@ failed.
 
 - The team builds **small programs in one file** (`app.py`) using only the Python standard library. Larger multi-file projects are not supported yet.
 - Small local models can make arithmetic mistakes. The Verifier and the test loop catch most of them, but check `DESIGN.md` yourself or use `--pause-after-design` for anything important.
-- "Approved" means the tests passed and the Reviewer agreed. It does not mean the program is free of bugs. That is why the independent edge-case suites exist.
+- "Approved" means the tests passed, the stress test found nothing, and the Reviewer agreed. It does not prove the program is free of bugs.
+- The stress test cannot know what a program is *supposed* to do. It finds crashes, hangs and `nan`/`inf` results, not wrong business logic.
 - Generated code runs on your machine during testing. Use `TEAM_USE_DOCKER=1` when you want real isolation.
 
 ---

@@ -59,6 +59,9 @@ MAX_TOKENS = int(os.getenv("TEAM_MAX_TOKENS", "0"))  # 0 = provider default
 REQUEST_LIMIT = int(os.getenv("TEAM_REQUEST_LIMIT", "6500"))  # approx tokens; 0 = never shrink
 REASONING_EFFORT = os.getenv("TEAM_REASONING_EFFORT", "")  # optional
 NUM_CTX = int(os.getenv("TEAM_NUM_CTX", "0"))  # 0 = use Ollama's default context size
+STRESS = os.getenv("TEAM_STRESS", "1") == "1"  # attack the finished program with hostile input
+STRESS_TIMEOUT = 5    # seconds allowed per probe
+STRESS_BUDGET = 90    # seconds allowed for the whole stress test
 DESIGN_REVIEW = os.getenv("TEAM_DESIGN_REVIEW", "1") == "1"
 DESIGN_CHECKS = int(os.getenv("TEAM_DESIGN_CHECKS", "2"))  # verify/fix rounds for the design; 0 = off
 
@@ -73,10 +76,23 @@ class ApiError(RuntimeError):
     """A problem reported by the hosted API (rate limit, request too large...)."""
 
 
+TEAM_CHARTER = (
+    "You are one member of a virtual software team. From a single plain-English "
+    "idea, the team produces a small, correct, production-quality Python program "
+    "with tests and docs. The pipeline is: PM (requirements) -> Architect (design) "
+    "-> DesignReview and Verifier (check the design) -> Developer (app.py) -> "
+    "Tester (test_app.py) -> automatic test run and stress test -> Reviewer -> "
+    "Docs (README). Each member does only their own job and trusts the others to "
+    "do theirs. The user will not add detail, so make sensible decisions yourself "
+    "and keep the scope small. The finished program must never show a traceback "
+    "to its user, never lose data, and never print nonsense such as nan or inf."
+)
+
+
 class Agent:
     def __init__(self, name: str, role: str):
         self.name = name
-        self.role = role
+        self.role = f"{TEAM_CHARTER}\n\nYour role: {role}"
         self.last_prompt = ""
 
     def ask(self, prompt: str, fallbacks=()) -> str:
@@ -226,7 +242,10 @@ pm = Agent(
     "You are a product manager. Turn the idea into a SHORT requirements list "
     "(max 6 bullets) for a small program that fits in ONE Python file, uses "
     "only the standard library, and has no network access. Keep the scope "
-    "small: fewer features done correctly beat many done badly.",
+    "small: fewer features done correctly beat many done badly. The user gave "
+    "you only one short sentence, so fill in sensible details yourself. Include "
+    "one bullet on how invalid input is handled and, if the program keeps data "
+    "between runs, one bullet on how it is stored.",
 )
 architect = Agent(
     "Architect",
@@ -259,7 +278,15 @@ architect = Agent(
     "whitespace-only input; for dates, impossible calendar days. "
     "Also add an 'Example session' "
     "section: the exact lines a user types into main() and the exact lines it "
-    "prints, ending with how the user quits. Keep it small and simple.",
+    "prints, ending with how the user quits. Keep it small and simple. "
+    "Money amounts use decimal.Decimal, never float, with at most 2 decimal "
+    "places. A program that takes command-line arguments prints errors to "
+    "stderr and exits with a non-zero status; an interactive program prints "
+    "the error and keeps running. If the input ends early (end of input or "
+    "Ctrl+C) the program ends cleanly. If the program saves data, state: the "
+    "file lives in the user's home folder; it is written to a temporary file "
+    "and then renamed; a missing file means an empty start; a corrupted file "
+    "is renamed to .bak and replaced by an empty one.",
 )
 design_reviewer = Agent(
     "DesignReview",
@@ -308,6 +335,10 @@ developer = Agent(
     "you write. Follow the design's data tables, formulas and input formats "
     "literally (keywords such as 'to' are part of the format) and never "
     "hard-code per-case constants that a table or formula already gives. "
+    "Wrap the body of main() so that end of input (EOFError) and Ctrl+C "
+    "(KeyboardInterrupt) end the program cleanly and no input can ever show a "
+    "traceback. Use decimal.Decimal for money. Check math.isfinite() or "
+    "Decimal.is_finite() on every parsed number before comparing it. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 tester = Agent(
@@ -326,7 +357,9 @@ tester = Agent(
     "appears; do not compare the whole output. "
     "Tests must be deterministic, must never touch the user's real files "
     "(use tempfile for any path the program reads or writes), and must not "
-    "use the network. "
+    "use the network. For every invalid-input rule in the design (nan, inf, "
+    "empty input, zero, negative, unknown command) add a test that the program "
+    "reports a clean error instead of raising an exception. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 reviewer = Agent(
@@ -334,7 +367,11 @@ reviewer = Agent(
     "You are a strict code reviewer focused on correctness, security, and "
     "clarity. If the code is acceptable, reply with the single word APPROVED. "
     "Otherwise reply with CHANGES NEEDED on the first line, followed by a "
-    "short bullet list of the most important problems only (max 5).",
+    "short bullet list of the most important problems only (max 5). Check "
+    "especially: can any user input cause a traceback; is money handled with "
+    "float instead of Decimal; are nan or inf accepted; can saved data be lost "
+    "or corrupted (no temporary file, no handling of a damaged file); is end "
+    "of input handled; does any error go to the wrong place.",
 )
 docs = Agent(
     "Docs",
@@ -501,9 +538,145 @@ def run_tests(workdir: Path) -> tuple[bool, str]:
         return False, f"Tests timed out after {TEST_TIMEOUT}s (infinite loop?)."
 
 
+# --------------------------------------------------------------------------
+# Stress test: attack the finished program with hostile input. No model is
+# involved, so every finding is a real crash, hang or nonsense result.
+# --------------------------------------------------------------------------
+HOSTILE_VALUES = [
+    "nan", "inf", "-inf", "1e999", "-1", "0", "0.0", "abc", "", "   ",
+    "9" * 400, "café ☃", "--help", "1/0", "None", "[]", "' OR 1=1 --",
+]
+QUIT_WORDS = "\nquit\nexit\nq\n"
+NOT_A_COMMAND = {"true", "false", "none", "yes", "no", "utf-8"}
+
+
+def command_words(code: str, limit: int = 15) -> list:
+    """Guess the program's command words (like deposit or add) from its source,
+    by looking at what strings it compares input against."""
+    word = r'["\']([A-Za-z][\w-]{1,14})["\']'
+    found = []
+    found += re.findall(r'(?:==|!=)\s*' + word, code)
+    found += re.findall(word + r'\s*(?:==|!=)', code)
+    found += re.findall(word + r'\s*:\s*[A-Za-z_]\w*\s*[,}]', code)  # {"add": cmd_add}
+    found += re.findall(r'add_parser\(\s*' + word, code)
+    for group in re.findall(r'\bin\s*[(\[{]([^)\]}]{0,200})[)\]}]', code):
+        found += re.findall(word, group)
+    seen, out = set(), []
+    for w in found:
+        if w.lower() not in seen and w.lower() not in NOT_A_COMMAND:
+            seen.add(w.lower())
+            out.append(w)
+    return out[:limit]
+
+
+def _probe(sandbox: Path, args: list, stdin_text: str):
+    """Run app.py once in an empty sandbox with a throwaway home folder, so the
+    program can never touch the user's real files. Returns the finished process,
+    or None if it timed out."""
+    if USE_DOCKER:
+        cmd = ["docker", "run", "--rm", "-i", "--network", "none", "--memory", "512m",
+               "-v", f"{sandbox.resolve()}:/work", "-w", "/work",
+               "python:3.12-slim", "python", "-B", "app.py", *args]
+    else:
+        cmd = [sys.executable, "-B", "app.py", *args]
+    import shutil
+    for item in sandbox.iterdir():  # every probe starts from a clean slate
+        if item.name != "app.py":
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+    home = str(sandbox / "_home")
+    os.makedirs(home, exist_ok=True)
+    try:
+        return subprocess.run(
+            cmd, cwd=sandbox, input=stdin_text, capture_output=True, text=True,
+            timeout=STRESS_TIMEOUT, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                 "HOME": home, "USERPROFILE": home},
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def stress_test(workdir: Path) -> list:
+    """Return a list of problems found (empty = the program survived)."""
+    import shutil
+    import tempfile
+    app = workdir / "app.py"
+    if not app.exists():
+        return []
+    code = app.read_text(encoding="utf-8", errors="replace")
+
+    probes = [("no input at all (the input ends immediately)", [], ""),
+              ("only blank lines", [], "\n  \n\t\n")]
+    for v in HOSTILE_VALUES:
+        probes.append((f"the input line {v[:30]!r}", [], v + QUIT_WORDS))
+        probes.append((f"the command-line argument {v[:30]!r}", [v], ""))
+    for w in command_words(code):
+        lines = [w] + [f"{w} {v}" for v in HOSTILE_VALUES]
+        probes.append((f"the commands {w!r} followed by hostile values", [], "\n".join(lines) + QUIT_WORDS))
+        for v in ("nan", "abc", "-1"):
+            probes.append((f"the arguments {w} {v}", [w, v], ""))
+        probes.append((f"the argument {w!r} alone", [w], ""))
+
+    # nan and inf can only appear if the program parses numbers with float/Decimal
+    parses_numbers = bool(re.search(r"\b(?:float|Decimal)\s*\(", code))
+    findings, seen = [], set()
+    started = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        sandbox = Path(tmp)
+        shutil.copy(app, sandbox / "app.py")
+        for label, args, stdin_text in probes:
+            if len(findings) >= 5 or time.time() - started > STRESS_BUDGET:
+                break
+            p = _probe(sandbox, args, stdin_text)
+            if p is None:
+                key = ("hang",)
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(
+                        f"Given {label}, app.py did not finish within {STRESS_TIMEOUT} seconds "
+                        f"(an infinite loop, or it keeps waiting after the input has ended).")
+                continue
+            text = (p.stderr or "") + (p.stdout or "")
+            if "Traceback (most recent call last)" in text:
+                err = p.stderr if "Traceback" in p.stderr else p.stdout
+                lines = err.strip().splitlines()
+                frames = re.findall(r'File ".*?app\.py", line (\d+)', err)
+                key = (frames[-1] if frames else "", lines[-1].split(":")[0] if lines else "")
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f"Given {label}, app.py crashed with a traceback:\n"
+                                    + "\n".join(lines[-4:]))
+                continue
+            for line in (p.stdout.splitlines() if parses_numbers else []):
+                if re.search(r"(?i)\b(error|invalid|must|not a|cannot|unknown|usage|unrecognized|expected)", line):
+                    continue
+                if re.search(r"(?<![\w.'\"])-?(?:nan|inf|infinity)(?![\w'\"])", line, re.I):
+                    key = ("nan", line.strip()[:20])
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append(f"Given {label}, app.py printed {line.strip()[:80]!r} "
+                                        f"as if it were a normal result (nan or inf was accepted).")
+                    break
+    return findings
+
+
 def git_commit(workdir: Path, message: str) -> None:
     try:
         if not (workdir / ".git").exists():
+            # If the output folder is already inside another git repository (for
+            # example your main project folder), do not create a nested repository
+            # there: it would stop the parent repo from tracking these files.
+            inside = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"], cwd=workdir,
+                capture_output=True, text=True)
+            if inside.returncode == 0 and inside.stdout.strip() == "true":
+                return
             subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
         subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
         subprocess.run(
@@ -714,6 +887,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
 
     approved = False
     review_skipped = False
+    last_stress = []  # stress-test problems found in the latest round
     last_output = ""
     best = None  # (tests passing, code, test_code) for the best version seen so far
     for rnd in range(1, MAX_ROUNDS + 1):
@@ -743,13 +917,31 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
         test_names, blocks = set(), {}
         if ok:
             best = (passed_count(output), code, test_code)
-            log("System", "Tests passed. Sending to review.")
-            verdict = reviewer.ask(f"```python\n{code}```")
-            if verdict.strip().upper().startswith("APPROVED"):
-                approved = True
-                break
-            code_feedback = f"The reviewer requested changes:\n{verdict}"
+            last_stress = stress_test(outdir) if STRESS else []
+            if last_stress:
+                log("System", f"Tests passed, but the stress test found {len(last_stress)} "
+                              f"problem(s) with hostile input:")
+                for line in last_stress:
+                    log("Stress", line.splitlines()[0][:160])
+                verdict = "\n".join(last_stress)
+                code_feedback = (
+                    "The tests pass, but an automatic stress test fed hostile input to "
+                    "app.py and found these real problems:\n\n" + verdict +
+                    "\n\nFix every one. Validate input before using it (reject nan, inf, "
+                    "empty and malformed values with a clean message), handle end of input, "
+                    "and make sure no input can ever show a traceback or hang the program. "
+                    "Keep every function the tests use."
+                )
+            else:
+                log("System", "Tests" + (" and stress test" if STRESS else "") +
+                              " passed. Sending to review.")
+                verdict = reviewer.ask(f"```python\n{code}```")
+                if verdict.strip().upper().startswith("APPROVED"):
+                    approved = True
+                    break
+                code_feedback = f"The reviewer requested changes:\n{verdict}"
         else:
+            last_stress = []
             blocks = failure_blocks(output)
             # Mistakes inside the test file itself (missing import, undefined name)
             # go to the Tester. Everything else goes to the Developer.
@@ -801,7 +993,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                     # The tests already pass; only the reviewer's suggestions do not fit the
                     # free tier's request size. Keep the working code and save the notes.
                     (outdir / "REVIEW_NOTES.md").write_text(
-                        "# Reviewer's requested changes (not applied)\n\n" + verdict + "\n",
+                        "# Requested changes (not applied)\n\n" + verdict + "\n",
                         encoding="utf-8")
                     log("System", "The reviewer's changes do not fit the free tier's request size; "
                                   "keeping the current code (all tests pass). Notes: REVIEW_NOTES.md")
@@ -839,8 +1031,10 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
             "applied (see REVIEW_NOTES.md).\n\n"
         ) + readme
     elif not approved:
+        why = ("its stress test (some hostile input still causes problems)"
+               if last_stress else "all of its tests or the review")
         readme = (
-            "> **Warning:** this code did not pass all of its tests or the review. "
+            f"> **Warning:** this code did not pass {why}. "
             "See last_test_output.txt. Parts of this README may be inaccurate.\n\n"
         ) + readme
     (outdir / "README.md").write_text(readme, encoding="utf-8")
@@ -862,13 +1056,33 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass
     parser = argparse.ArgumentParser(description="Virtual software team")
-    parser.add_argument("idea", help='e.g. "a command-line budget tracker"')
-    parser.add_argument("--out", default="./team_output", help="output folder")
+    parser.add_argument("idea", nargs="?", default="",
+                        help='e.g. "a command-line budget tracker" (asked for if left out)')
+    parser.add_argument("--out", default="",
+                        help="output folder (default: team_output/<name made from the idea>)")
     parser.add_argument("--pause-after-design", action="store_true",
                         help="stop after the design so you can check and edit DESIGN.md")
     parser.add_argument("--design", default="",
                         help="use this design file instead of generating one")
     args = parser.parse_args()
+
+    idea = args.idea.strip()
+    if not idea:
+        try:
+            idea = input("What should the team build? ").strip()
+        except EOFError:
+            idea = ""
+    if not idea:
+        sys.exit("No idea given. Example: python virtual_team.py \"a bank account manager\"")
+    if args.out:
+        out_dir = Path(args.out)
+    else:  # its own folder next to the other projects, e.g. bank_account_manager_app
+        slug = re.sub(r"[^a-z0-9]+", "_", idea.lower()).strip("_")
+        slug = re.sub(r"^(?:a|an|the)_", "", slug)[:30].strip("_") or "project"
+        out_dir, n = Path(f"{slug}_app"), 2
+        while out_dir.exists() and any(out_dir.iterdir()):  # never overwrite an earlier project
+            out_dir, n = Path(f"{slug}_app{n}"), n + 1
+    args.out = str(out_dir)
 
     where = API_BASE or OLLAMA_URL
     log("System", f"Model: {MODEL} via {where} | max rounds: {MAX_ROUNDS}")
@@ -876,7 +1090,7 @@ def main() -> None:
         log("System", "NOTE: TEAM_API_BASE is not set, so this run uses LOCAL Ollama (slow on "
                       "8 GB of RAM). To use Groq, set TEAM_API_BASE, TEAM_API_KEY and TEAM_MODEL first.")
     try:
-        build(args.idea, Path(args.out), args.pause_after_design, args.design)
+        build(idea, out_dir, args.pause_after_design, args.design)
     except ApiError as error:
         sys.exit(f"API error: {error}\nFiles written so far are in {args.out}.")
     except requests.ReadTimeout:
