@@ -1,0 +1,7 @@
+MISMATCH len_arg_count_msg: design says 71, rules give 61
+MISMATCH len_bill_type_msg: design says 30, rules give 29
+MISMATCH len_percent_type_msg: design says 34, rules give 32
+MISMATCH len_people_type_msg: design says 44, rules give 41
+MISMATCH len_bill_positive_msg: design says 41, rules give 38
+MISMATCH len_percent_positive_msg: design says 45, rules give 41
+MISMATCH len_people_positive_msg: design says 44, rules give 41

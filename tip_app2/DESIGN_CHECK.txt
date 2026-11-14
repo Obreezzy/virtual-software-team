@@ -1,0 +1,1 @@
+MISMATCH main wrong arg count: design says SystemExit, rules raise ValueError: exactly three arguments required: BILL PERCENT PEOPLE
