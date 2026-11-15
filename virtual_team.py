@@ -42,10 +42,14 @@ import requests
 # Load settings and keys from a local .env file (never committed to git).
 # This must run BEFORE the os.getenv() calls below, or .env would be ignored.
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import find_dotenv, load_dotenv
+    _env_path = find_dotenv()
+    load_dotenv(_env_path or None)
+    DOTENV_NOTE = (f"settings file: {_env_path}" if _env_path
+                   else "no .env file was found next to virtual_team.py")
 except ImportError:
-    pass  # python-dotenv is optional; plain environment variables still work
+    DOTENV_NOTE = ("python-dotenv is NOT installed, so your .env file is being ignored "
+                   "(fix: pip install python-dotenv)")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("TEAM_MODEL", "qwen2.5-coder:7b")
@@ -323,7 +327,9 @@ verifier = Agent(
     "lambda or a value and expected is copied exactly as the design states it; "
     "and check_raises(label, lambda_that_should_raise, ExceptionType, "
     "expected_message_or_None). Wrap each call in its own lambda so one "
-    "failure cannot stop the others. Print nothing yourself. "
+    "failure cannot stop the others. Print nothing yourself. Keep the script "
+    "SHORT (about 100 lines at most): implement only the functions that the "
+    "worked examples call, and write terse checks. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 developer = Agent(
@@ -339,6 +345,23 @@ developer = Agent(
     "(KeyboardInterrupt) end the program cleanly and no input can ever show a "
     "traceback. Use decimal.Decimal for money. Check math.isfinite() or "
     "Decimal.is_finite() on every parsed number before comparing it. "
+    "Reject numbers beyond a sensible maximum (for money, more than 1e12) with "
+    "a clean message, because values such as 1e999 are finite for Decimal but "
+    "crash rounding. For money, reject more than 2 decimal places with a clear "
+    "message instead of silently rounding. Never write a blanket "
+    "`except Exception` that prints a vague message such as 'unexpected "
+    "problem': catch only the specific exceptions you expect, so that real "
+    "bugs are not hidden. When you load saved data, check the type and range of "
+    "every value (a balance must be a finite, non-negative number) and treat "
+    "anything else as a damaged file with a clear message. Never print Python "
+    "repr text in a message (a KeyError's str() has stray quotes: use "
+    "e.args[0]). An unknown menu choice or command must print a message such "
+    "as 'Invalid option'. If a data file exists but cannot be read, or contains "
+    "an invalid record, NEVER continue with empty data that the next save "
+    "would write over it, and never silently drop a record: either stop with a "
+    "clear one-line message, or first rename the file to <name>.corrupt "
+    "(keeping every byte) and tell the user. Never show raw exception text such "
+    "as a JSON decoder message to the user. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 tester = Agent(
@@ -371,7 +394,12 @@ reviewer = Agent(
     "especially: can any user input cause a traceback; is money handled with "
     "float instead of Decimal; are nan or inf accepted; can saved data be lost "
     "or corrupted (no temporary file, no handling of a damaged file); is end "
-    "of input handled; does any error go to the wrong place.",
+    "of input handled; does any error go to the wrong place; does a blanket "
+    "`except Exception` hide a real bug behind a vague message; are numbers "
+    "beyond a sensible maximum rejected; is data loaded from a file checked "
+    "for type and range; if a data file is damaged, does the program carry on "
+    "with empty data that the next save would write over it, or silently drop "
+    "records, or show raw exception text.",
 )
 docs = Agent(
     "Docs",
@@ -381,7 +409,8 @@ docs = Agent(
     "are test_app.py and run with `python -m unittest`. Do NOT invent URLs, "
     "git repositories, folders, or features that are not in the code. Every "
     "example must be something the code can actually do: check it against "
-    "the code first.",
+    "the code first. Use plain ASCII characters only: ordinary hyphens, "
+    "straight quotes, no special dashes or emoji.",
 )
 
 
@@ -465,6 +494,81 @@ def signatures_only(code: str) -> str:
     return "\n".join(keep) + "\n# (function bodies left out to save space)"
 
 
+def merge_patch(code: str, patch: str):
+    """Merge a patch (only the changed top-level functions/classes, plus any new
+    imports or constants) into code. Returns the merged source, or None if the
+    patch cannot be understood. A reply that is really the whole file also works."""
+    try:
+        old_tree, new_tree = ast.parse(code), ast.parse(patch)
+    except SyntaxError:
+        return None
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    patch_nodes = [n for n in new_tree.body
+                   if isinstance(n, defs + (ast.Import, ast.ImportFrom, ast.Assign))]
+    if not any(isinstance(n, defs) for n in patch_nodes):
+        return None
+    old_defs = {n.name for n in old_tree.body if isinstance(n, defs)}
+    patch_defs = {n.name for n in patch_nodes if isinstance(n, defs)}
+    has_guard = any(isinstance(n, ast.If) and "__name__" in ast.dump(n.test) for n in new_tree.body)
+    if has_guard and len(patch_defs & old_defs) >= 0.8 * len(old_defs):
+        return patch  # the model sent the whole file; use it as it is
+
+    lines = code.splitlines()
+    patch_lines = patch.splitlines()
+
+    def span(node, source_lines):
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        return first - 1, node.end_lineno  # slice bounds
+
+    def segment(node):
+        a, b = span(node, patch_lines)
+        return patch_lines[a:b]
+
+    def target_names(node):
+        return {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    replacements, additions, new_imports = [], [], []
+    old_imports = {ast.dump(n) for n in old_tree.body if isinstance(n, (ast.Import, ast.ImportFrom))}
+    for node in patch_nodes:
+        if isinstance(node, defs):
+            match = next((o for o in old_tree.body if isinstance(o, defs) and o.name == node.name), None)
+            if match is not None:
+                a, b = span(match, lines)
+                replacements.append((a, b, segment(node)))
+            else:
+                additions.append(segment(node))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if ast.dump(node) not in old_imports:
+                new_imports.append(segment(node))
+        else:  # a module-level constant
+            match = next((o for o in old_tree.body if isinstance(o, ast.Assign)
+                          and target_names(o) & target_names(node)), None)
+            if match is not None:
+                a, b = span(match, lines)
+                replacements.append((a, b, segment(node)))
+            else:
+                new_imports.append(segment(node))
+    for a, b, new in sorted(replacements, key=lambda r: -r[0]):
+        lines[a:b] = new
+    if additions:
+        guard = next((i for i, l in enumerate(lines) if l.startswith("if __name__")), len(lines))
+        block = []
+        for add in additions:
+            block += ["", ""] + add
+        lines[guard:guard] = block + ([""] if guard < len(lines) else [])
+    if new_imports:
+        last_import = max([n.end_lineno for n in ast.parse("\n".join(lines)).body
+                           if isinstance(n, (ast.Import, ast.ImportFrom))] or [0])
+        flat = [l for seg in new_imports for l in seg]
+        lines[last_import:last_import] = flat
+    merged = "\n".join(lines) + "\n"
+    try:
+        ast.parse(merged)
+    except SyntaxError:
+        return None
+    return merged
+
+
 def fix_prompts(design: str, code: str, test_code: str, feedback: str) -> list:
     """The full fix prompt first, then progressively shorter versions that are
     tried only if the hosted API says the request is too large."""
@@ -474,15 +578,20 @@ def fix_prompts(design: str, code: str, test_code: str, feedback: str) -> list:
             f"Tests (test_app.py):\n```python\n{t}```\n\n"
             f"{f}\n\nFirst, in 2-3 sentences outside any code block, "
             f"trace the first failing test step by step through app.py and "
-            f"name the exact line where it goes wrong. Then return the "
-            f"COMPLETE corrected app.py (every function, not just the changed "
-            f"part) in one python code block."
+            f"name the exact line where it goes wrong. Then return ONLY the "
+            f"top-level functions or classes you changed or added, each one "
+            f"COMPLETE, in ONE python code block (add any new import lines or "
+            f"module-level constants too). Do NOT repeat functions you did not "
+            f"change and do not return the whole file."
         )
     short = without_examples(design)
     return [
         make(design, test_code, feedback),
         make(short, test_code, feedback),
         make(short, "(left out to save space)", feedback[-2500:]),
+        make("(left out to save space; the tests and the failure output below show "
+             "what is required)", "(left out to save space)", feedback[-2500:]),
+        make("(left out)", "(left out)", feedback[-1200:]),
     ]
 
 
@@ -616,6 +725,12 @@ def stress_test(workdir: Path) -> list:
     for v in HOSTILE_VALUES:
         probes.append((f"the input line {v[:30]!r}", [], v + QUIT_WORDS))
         probes.append((f"the command-line argument {v[:30]!r}", [v], ""))
+    # Menu programs ask for a number, then a name, then an amount. Create an
+    # account first, then answer each menu option's prompts with a hostile value.
+    for v in HOSTILE_VALUES:
+        steps = "".join(f"{n}\nAcct\n{v}\n{v}\n" for n in "12345")
+        probes.append((f"menu options 1-5 answered with 'Acct' and then {v[:30]!r}",
+                       [], "1\nAcct\n10\n" + steps + QUIT_WORDS))
     for w in command_words(code):
         lines = [w] + [f"{w} {v}" for v in HOSTILE_VALUES]
         probes.append((f"the commands {w!r} followed by hostile values", [], "\n".join(lines) + QUIT_WORDS))
@@ -652,6 +767,20 @@ def stress_test(workdir: Path) -> list:
                     seen.add(key)
                     findings.append(f"Given {label}, app.py crashed with a traceback:\n"
                                     + "\n".join(lines[-4:]))
+                continue
+            vague = re.search(r"(?i)unexpected (?:problem|error)|something went wrong|"
+                              r"internal error|please restart|unhandled|an error occurred", text)
+            if vague:
+                key = ("vague", vague.group(0).lower())
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(
+                        f"Given {label}, app.py printed the vague message {vague.group(0)!r}. "
+                        f"A blanket `except Exception` is hiding a real bug. Find which "
+                        f"exception is raised (for example a Decimal InvalidOperation from a "
+                        f"huge number such as 1e999, or a wrongly typed value loaded from the "
+                        f"data file), remove the blanket handler and handle that case with a "
+                        f"specific, clear message.")
                 continue
             for line in (p.stdout.splitlines() if parses_numbers else []):
                 if re.search(r"(?i)\b(error|invalid|must|not a|cannot|unknown|usage|unrecognized|expected)", line):
@@ -969,10 +1098,10 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
         if fix_tests:
             names = ", ".join(sorted(test_names))
             evidence = "\n\n".join(blocks[n][-800:] for n in sorted(test_names))
-            test_code = clean_tests(
-                tester.ask(
-                    f"Design:\n{design}\n\napp.py:\n```python\n{code}```\n\n"
-                    f"Current test_app.py:\n```python\n{test_code}```\n\n"
+            def tester_fix_prompt(d, c, t):
+                return (
+                    f"Design:\n{d}\n\napp.py:\n```python\n{c}```\n\n"
+                    f"Current test_app.py:\n```python\n{t}```\n\n"
                     f"These tests need attention: {names}\n\n"
                     f"Their failure output:\n{evidence}\n\n"
                     f"If the failure is a mistake in the test file itself (a missing "
@@ -980,14 +1109,29 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                     f"sys.stdout), fix the test file. Do not change any expected "
                     f"values. Return the full test_app.py."
                 )
-            )
+            try:
+                test_code = clean_tests(
+                    tester.ask(
+                        tester_fix_prompt(design, code, test_code),
+                        fallbacks=[
+                            tester_fix_prompt(without_examples(design), signatures_only(code), test_code),
+                            tester_fix_prompt("(omitted to save space)", signatures_only(code), test_code),
+                        ],
+                    )
+                )
+            except ApiError as error:
+                if "413" not in str(error):
+                    raise
+                log("System", "The test-file fix does not fit the free tier's request size; "
+                              "keeping the current tests and fixing the code instead.")
             (outdir / "test_app.py").write_text(test_code, encoding="utf-8")
             git_commit(outdir, f"Fix tests, round {rnd}")
 
         if fix_code:
             prompts = fix_prompts(design, code, test_code, code_feedback)
             try:
-                new_code = extract_code(developer.ask(prompts[0], fallbacks=prompts[1:]))
+                reply_code = extract_code(developer.ask(prompts[0], fallbacks=prompts[1:]))
+                new_code = merge_patch(code, reply_code) or reply_code
             except ApiError as error:
                 if ok and "413" in str(error):
                     # The tests already pass; only the reviewer's suggestions do not fit the
@@ -999,17 +1143,30 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                                   "keeping the current code (all tests pass). Notes: REVIEW_NOTES.md")
                     review_skipped = True
                     break
+                if "413" in str(error):
+                    # Even the shortest prompt is too big for the free tier. Stop fixing,
+                    # keep the best code so far and still write the README and notes.
+                    log("System", "Even the shortest fix request is too large for the free tier; "
+                                  "stopping here with the current code. See last_test_output.txt.")
+                    break
                 raise
             problem = fix_problem(code, new_code, test_code)
             if problem:
                 log("System", f"Rejected the fix: {problem}. Asking again.")
-                new_code = extract_code(
-                    developer.ask(
-                        developer.last_prompt + f"\n\nYour previous reply was rejected because "
-                        f"{problem}. Return the COMPLETE file in one code block."
+                try:
+                    retry_code = extract_code(
+                        developer.ask(
+                            developer.last_prompt + f"\n\nYour previous reply was rejected because "
+                            f"{problem}. Return ONLY the changed top-level functions, each one "
+                            f"COMPLETE and valid Python, in one code block."
+                        )
                     )
-                )
-                problem = fix_problem(code, new_code, test_code)
+                    new_code = merge_patch(code, retry_code) or retry_code
+                    problem = fix_problem(code, new_code, test_code)
+                except ApiError as error:
+                    if "413" not in str(error):
+                        raise
+                    problem = "the retry did not fit the free tier's request size"
             if problem:
                 log("System", f"Rejected again ({problem}); keeping the previous code.")
             else:
@@ -1025,6 +1182,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
             f"```python\n{signatures_only(code)}\n```",
         ],
     )
+    readme = clean_design(readme)
     if review_skipped:
         readme = (
             "> **Note:** all tests pass, but the reviewer's requested changes could not be "
@@ -1088,7 +1246,8 @@ def main() -> None:
     log("System", f"Model: {MODEL} via {where} | max rounds: {MAX_ROUNDS}")
     if not API_BASE:
         log("System", "NOTE: TEAM_API_BASE is not set, so this run uses LOCAL Ollama (slow on "
-                      "8 GB of RAM). To use Groq, set TEAM_API_BASE, TEAM_API_KEY and TEAM_MODEL first.")
+                      "8 GB of RAM). To use Groq, set TEAM_API_BASE, TEAM_API_KEY and TEAM_MODEL "
+                      "in your .env file (or in this terminal). " + DOTENV_NOTE)
     try:
         build(idea, out_dir, args.pause_after_design, args.design)
     except ApiError as error:
