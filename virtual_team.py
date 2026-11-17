@@ -16,6 +16,10 @@ Environment variables:
     TEAM_MODEL       Model name             (default: qwen2.5-coder:7b)
     OLLAMA_URL       Ollama server address  (default: http://localhost:11434)
     TEAM_MAX_ROUNDS  Max fix/review rounds  (default: 5)
+    TEAM_PROJECT     auto (default): big ideas become several small files;
+                     always / never force it (same as --project / --single)
+    TEAM_ANSWER_CHECKS  Fix rounds allowed for wrong answers found by the answer
+                     check (default 2, 0 = off)
     TEAM_USE_DOCKER  Set to 1 to run tests inside Docker (no network, safer)
     TEAM_NUM_CTX     Ollama context window in tokens (default: Ollama's own default)
     TEAM_MAX_TOKENS  Max tokens per reply for hosted APIs (default: provider's own limit)
@@ -67,6 +71,9 @@ STRESS = os.getenv("TEAM_STRESS", "1") == "1"  # attack the finished program wit
 STRESS_TIMEOUT = 5    # seconds allowed per probe
 STRESS_BUDGET = 90    # seconds allowed for the whole stress test
 DESIGN_REVIEW = os.getenv("TEAM_DESIGN_REVIEW", "1") == "1"
+DESIGN_BUDGET = int(os.getenv("TEAM_DESIGN_BUDGET", "7500"))  # max design size in characters; 0 = off
+PROJECT_MODE = os.getenv("TEAM_PROJECT", "auto")  # auto / always / never (several files)
+ANSWER_CHECKS = int(os.getenv("TEAM_ANSWER_CHECKS", "2"))  # answer-check fix rounds; 0 = off
 DESIGN_CHECKS = int(os.getenv("TEAM_DESIGN_CHECKS", "2"))  # verify/fix rounds for the design; 0 = off
 
 def log(who: str, msg: str) -> None:
@@ -246,13 +253,15 @@ pm = Agent(
     "You are a product manager. Turn the idea into a SHORT requirements list "
     "(max 6 bullets) for a small program that fits in ONE Python file, uses "
     "only the standard library, and has no network access. Keep the scope "
-    "small: fewer features done correctly beat many done badly. The user gave "
+    "small: the finished program must stay under about 200 lines. If the idea "
+    "is big, pick the smallest useful core (about 5 operations), leave the "
+    "rest out and say in one bullet what was left out. Fewer features done "
+    "correctly beat many done badly. The user gave "
     "you only one short sentence, so fill in sensible details yourself. Include "
     "one bullet on how invalid input is handled and, if the program keeps data "
     "between runs, one bullet on how it is stored.",
 )
-architect = Agent(
-    "Architect",
+ARCHITECT_ROLE = (
     "You are a software architect. Given requirements, write a design for a "
     "single module called app.py. List every function/class with its exact "
     "signature, inputs, outputs and behavior. For anything non-trivial, spell "
@@ -280,6 +289,8 @@ architect = Agent(
     "Decimal.is_finite() BEFORE any comparison) with the same 'must be a "
     "number' message; for text, decide what happens with empty or "
     "whitespace-only input; for dates, impossible calendar days. "
+    "The whole design must stay under about 1200 words and describe at "
+    "most 10 functions; cut features rather than exceed that. "
     "Also add an 'Example session' "
     "section: the exact lines a user types into main() and the exact lines it "
     "prints, ending with how the user quits. Keep it small and simple. "
@@ -290,8 +301,43 @@ architect = Agent(
     "Ctrl+C) the program ends cleanly. If the program saves data, state: the "
     "file lives in the user's home folder; it is written to a temporary file "
     "and then renamed; a missing file means an empty start; a corrupted file "
-    "is renamed to .bak and replaced by an empty one.",
+    "is renamed to .bak and replaced by an empty one."
 )
+architect = Agent("Architect", ARCHITECT_ROLE)
+planner = Agent(
+    "Planner",
+    "You are a software architect who splits a program into a few SMALL Python "
+    "modules so that each one can be designed, written and tested on its own "
+    "with very little context. Reply with ONLY one JSON object, no other text, "
+    'of exactly this shape: {"requirements": ["up to 8 short bullets: what the '
+    'program does, how invalid input is handled, how data is stored if it is"], '
+    '"modules": [{"name": "snake_case_name", "purpose": "one sentence", "api": '
+    '["def function_name(arg: type) -> type  # one-line behaviour and which '
+    'errors it raises"]}]}. Rules: 2 to 5 modules, in dependency order (a module '
+    "may import only modules listed before it); the LAST module must be named "
+    '"app": it holds main(argv=None) and the command-line handling and printing; '
+    "every other module is a library of plain functions that never prints or "
+    "reads input; at most 6 functions per module, each with an exact signature "
+    "with types; put shared things (such as the exception class) in the first "
+    "module; use standard library only; never name a module like a standard "
+    "library module (no parser, types, string, json, logging, io, ...); every "
+    "function a module needs from another module must appear in that module's "
+    "api list. Keep the program as small as the idea allows.",
+)
+module_architect = Agent(
+    "Architect",
+    ARCHITECT_ROLE + " MULTI-FILE MODE (these rules override the earlier ones where "
+    "they differ): you design ONLY ONE module of a larger program, described to "
+    "you together with the plan and the real signatures of the modules already "
+    "written. Implement exactly the functions the plan lists for this module "
+    "with the same names and signatures; import from earlier modules with "
+    "`from <module> import <name>`, never redefine them. The file is named "
+    "after the module, not app.py. A library module has no main, prints "
+    "nothing and reads no input, so leave out the 'Example session' section "
+    "and give 4-6 'Worked examples' lines for its functions. The entry module "
+    "app has main and an 'Example session'. Keep the design under 900 words.",
+)
+
 design_reviewer = Agent(
     "DesignReview",
     "You are a design reviewer. Check the design against the original idea. "
@@ -330,6 +376,38 @@ verifier = Agent(
     "failure cannot stop the others. Print nothing yourself. Keep the script "
     "SHORT (about 100 lines at most): implement only the functions that the "
     "worked examples call, and write terse checks. "
+    "Reply with exactly one ```python code block and nothing else.",
+)
+examiner = Agent(
+    "Examiner",
+    "You are an independent examiner. You have NOT seen the program's code; you "
+    "only know the idea, the design and the program's function signatures. Write "
+    "ONE self-contained Python script (standard library only) that tests the "
+    "finished program by running it and comparing what it prints with exact "
+    "expected answers that YOU derive. Helpers already exist; do NOT define them: "
+    "run_app(stdin_text='', args=(), fresh=True) runs `python app.py` and returns "
+    "everything it printed (fresh=False keeps files saved by the previous run, "
+    "to test saving and restarting); load_app() imports app.py as a module so you "
+    "can call its functions; expect_line(label, output, expected, source) passes "
+    "when some output line equals expected (a leading '> ' prompt is ignored; "
+    "numbers are compared with a small tolerance); expect_in(label, output, "
+    "text, source) passes when the text occurs in the output (case and spacing "
+    "ignored); expect_not_in(label, output, text, source); expect(label, actual, "
+    "expected, source) compares a value, where actual may be a zero-argument "
+    "lambda. 'source' is one short phrase saying WHY the answer is right (the "
+    "idea's wording, a design rule, or a standard fact such as the usual order "
+    "of operations). Derive every expected value ONLY from the idea, the "
+    "design's rules and worked examples, or universally agreed facts; compute by "
+    "hand carefully. Include only cases whose answer you are certain of, and "
+    "skip anything the design leaves open (such as the exact wording of an error "
+    "message the design does not state; prefer checking numbers and results). "
+    "Cover the hardest cases first: every example in the idea's own wording, "
+    "precedence and ordering rules, boundaries (smallest, largest, zero, "
+    "negative), rounding, totals and sorting, and data that must survive a "
+    "restart (two run_app calls, the second with fresh=False). Feed the program "
+    "the way the design's example session does, and end interactive input with "
+    "the program's quit command so it exits. Write 15 to 30 terse checks, each "
+    "on its own line, about 80 lines in all. Print nothing yourself. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 developer = Agent(
@@ -455,6 +533,7 @@ def looks_like_test_bug(block: str) -> bool:
     return bool(
         re.search(r"^(?:NameError|ImportError|ModuleNotFoundError|SyntaxError|IndentationError)\b", block, re.M)
         or re.search(r"^AttributeError: module '(?!app')", block, re.M)
+        or re.search(r"^AttributeError: '_io\.TextIOWrapper' object has no attribute 'getvalue'", block, re.M)
     )
 
 
@@ -494,6 +573,25 @@ def signatures_only(code: str) -> str:
     return "\n".join(keep) + "\n# (function bodies left out to save space)"
 
 
+def static_problems(code: str) -> list:
+    """Cheap checks for a file that was cut off or garbled. These pass Python's own
+    syntax check, so only a look at the structure catches them."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return [f"syntax error on line {exc.lineno}: {exc.msg}"]
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Name):
+            problems.append(f"line {node.lineno} is just the bare name '{node.value.id}', a "
+                            f"statement that does nothing (a reply that was cut off in the middle)")
+    has_guard = any(isinstance(n, ast.If) and "__name__" in ast.dump(n.test) for n in tree.body)
+    if "main" in (defined_names(code) or set()) and not has_guard:
+        problems.append('the file has no `if __name__ == "__main__":` block that calls main(), '
+                        "so it looks cut off at the end")
+    return problems[:4]
+
+
 def merge_patch(code: str, patch: str):
     """Merge a patch (only the changed top-level functions/classes, plus any new
     imports or constants) into code. Returns the merged source, or None if the
@@ -505,12 +603,12 @@ def merge_patch(code: str, patch: str):
     defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     patch_nodes = [n for n in new_tree.body
                    if isinstance(n, defs + (ast.Import, ast.ImportFrom, ast.Assign))]
-    if not any(isinstance(n, defs) for n in patch_nodes):
+    has_guard = any(isinstance(n, ast.If) and "__name__" in ast.dump(n.test) for n in new_tree.body)
+    if not any(isinstance(n, defs) for n in patch_nodes) and not has_guard:
         return None
     old_defs = {n.name for n in old_tree.body if isinstance(n, defs)}
     patch_defs = {n.name for n in patch_nodes if isinstance(n, defs)}
-    has_guard = any(isinstance(n, ast.If) and "__name__" in ast.dump(n.test) for n in new_tree.body)
-    if has_guard and len(patch_defs & old_defs) >= 0.8 * len(old_defs):
+    if has_guard and old_defs and len(patch_defs & old_defs) >= 0.8 * len(old_defs):
         return patch  # the model sent the whole file; use it as it is
 
     lines = code.splitlines()
@@ -561,6 +659,11 @@ def merge_patch(code: str, patch: str):
                            if isinstance(n, (ast.Import, ast.ImportFrom))] or [0])
         flat = [l for seg in new_imports for l in seg]
         lines[last_import:last_import] = flat
+    if has_guard and not any(isinstance(n, ast.If) and "__name__" in ast.dump(n.test)
+                             for n in old_tree.body):
+        guard_node = next(n for n in new_tree.body
+                          if isinstance(n, ast.If) and "__name__" in ast.dump(n.test))
+        lines += ["", ""] + segment(guard_node)
     merged = "\n".join(lines) + "\n"
     try:
         ast.parse(merged)
@@ -569,12 +672,178 @@ def merge_patch(code: str, patch: str):
     return merged
 
 
+def drop_self_imports(code: str, module: str) -> str:
+    """While a module is built on its own it is saved as app.py, so a line such as
+    `from <its own name> import x` can never work (and a patch of whole functions
+    cannot remove an import line). Remove such lines; the names are defined in the file."""
+    if not module:
+        return code
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    lines = code.splitlines()
+    mine = [n for n in tree.body
+            if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in (module, "app")]
+    if not mine:
+        return code
+    for n in sorted(mine, key=lambda n: -n.lineno):
+        del lines[n.lineno - 1:n.end_lineno]
+    result = "\n".join(lines) + "\n"
+    try:
+        ast.parse(result)
+    except SyntaxError:
+        return code
+    return result
+
+
+def drop_main_tests(test_code: str) -> str:
+    """A library module has no main(); remove any test that calls it."""
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return test_code
+    funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
+    spans = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        tests = [m for m in node.body if isinstance(m, funcs) and m.name.startswith("test")]
+        bad = [m for m in tests if re.search(r"\bmain\s*\(", ast.get_source_segment(test_code, m) or "")]
+        if not bad:
+            continue
+        if len(bad) == len(tests):
+            spans.append((min([node.lineno] + [d.lineno for d in node.decorator_list]), node.end_lineno))
+        else:
+            spans += [(min([m.lineno] + [d.lineno for d in m.decorator_list]), m.end_lineno) for m in bad]
+    if not spans:
+        return test_code
+    lines = test_code.splitlines()
+    for a, b in sorted(spans, reverse=True):
+        del lines[a - 1:b]
+    result = "\n".join(lines) + "\n"
+    try:
+        ast.parse(result)
+    except SyntaxError:
+        return test_code
+    return result
+
+
+def reorder_constants(code: str) -> str:
+    """Move module-level constants (such as a table of handlers) that use a function
+    or class defined LATER in the file to just before the `if __name__` guard, so
+    the module can be imported (otherwise: NameError at import)."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    def_line = {n.name: n.lineno for n in tree.body if isinstance(n, defs)}
+
+    def eager_names(node):
+        stack, found = [node], set()
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, ast.Lambda):
+                continue  # a lambda body runs later, so its names may be defined later
+            if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Load):
+                found.add(cur.id)
+            stack.extend(ast.iter_child_nodes(cur))
+        return found
+
+    moving = [n for n in tree.body
+              if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None
+              and any(def_line.get(name, 0) > n.end_lineno for name in eager_names(n.value))]
+    if not moving:
+        return code
+    lines = code.splitlines()
+    moved = []
+    for n in sorted(moving, key=lambda n: -n.lineno):
+        moved.insert(0, lines[n.lineno - 1:n.end_lineno])
+        del lines[n.lineno - 1:n.end_lineno]
+    guard = next((i for i, l in enumerate(lines) if l.startswith("if __name__")), len(lines))
+    block = []
+    for seg in moved:
+        block += seg + [""]
+    lines[guard:guard] = [""] + block
+    result = "\n".join(lines) + "\n"
+    try:
+        ast.parse(result)
+    except SyntaxError:
+        return code
+    return result
+
+
+def apply_reply(code: str, reply: str) -> str:
+    """Turn a Developer reply (usually a patch, sometimes a whole file) into the new
+    app.py. A reply that is neither a usable patch nor a whole file is ignored,
+    instead of replacing the program with a fragment."""
+    merged = merge_patch(code, reply)
+    if merged is None:
+        try:
+            new_tree, old_tree = ast.parse(reply), ast.parse(code)
+        except SyntaxError:
+            return code
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        new_defs = {n.name for n in new_tree.body if isinstance(n, defs)}
+        old_defs = {n.name for n in old_tree.body if isinstance(n, defs)}
+        if old_defs and len(new_defs & old_defs) < 0.8 * len(old_defs):
+            return code
+        merged = reply
+    return reorder_constants(merged)
+
+
+def failing_test_source(test_code: str, feedback: str, limit: int = 2500) -> str:
+    """Source code of just the tests named as FAIL/ERROR in the feedback, so even the
+    smallest fix prompt shows what the failing test expects."""
+    names = re.findall(r"(?:FAIL|ERROR): (test\w+)", feedback)
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        return "(left out to save space)"
+    lines = test_code.splitlines()
+    pieces = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+            pieces.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+    return ("\n\n".join(pieces)[:limit]) if pieces else "(left out to save space)"
+
+
+def focused_code(code: str, feedback: str, test_src: str = ""):
+    """app.py with only the functions that matter written out in full: the ones named
+    in the failure traceback and the ones the failing tests call. Everything else is
+    reduced to its signature. Returns None if nothing could be singled out."""
+    wanted = set(re.findall(r'File ".*?app\.py", line \d+, in (\w+)', feedback))
+    wanted |= set(re.findall(r"\bapp\.(\w+)", test_src))
+    wanted |= set(re.findall(r"\b(\w+)\(", feedback[-1500:])) & set(defined_names(code) or ())
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    lines = code.splitlines()
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    out, hit = [], False
+    for node in tree.body:
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])]) - 1
+        if isinstance(node, defs):
+            if node.name in wanted:
+                hit = True
+                out.append("\n".join(lines[first:node.end_lineno]))
+            else:
+                header = lines[node.lineno - 1]
+                out.append(header + "\n    ...  # body left out to save space")
+        elif isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign)):
+            out.append("\n".join(lines[first:node.end_lineno]))
+    return "\n\n".join(out) + "\n" if hit else None
+
+
 def fix_prompts(design: str, code: str, test_code: str, feedback: str) -> list:
     """The full fix prompt first, then progressively shorter versions that are
     tried only if the hosted API says the request is too large."""
-    def make(d, t, f):
+    def make(d, t, f, c=None):
+        c = code if c is None else c
         return (
-            f"Design:\n{d}\n\nCurrent app.py:\n```python\n{code}```\n\n"
+            f"Design:\n{d}\n\nCurrent app.py:\n```python\n{c}```\n\n"
             f"Tests (test_app.py):\n```python\n{t}```\n\n"
             f"{f}\n\nFirst, in 2-3 sentences outside any code block, "
             f"trace the first failing test step by step through app.py and "
@@ -585,14 +854,28 @@ def fix_prompts(design: str, code: str, test_code: str, feedback: str) -> list:
             f"change and do not return the whole file."
         )
     short = without_examples(design)
-    return [
+    failing = failing_test_source(test_code, feedback)
+    focus = focused_code(code, feedback, failing)
+    prompts = [
         make(design, test_code, feedback),
         make(short, test_code, feedback),
-        make(short, "(left out to save space)", feedback[-2500:]),
-        make("(left out to save space; the tests and the failure output below show "
-             "what is required)", "(left out to save space)", feedback[-2500:]),
-        make("(left out)", "(left out)", feedback[-1200:]),
     ]
+    if focus:
+        # Only the functions that matter are written out in full; the rest are signatures.
+        prompts += [
+            make(short, failing, feedback[-3000:], focus),
+            make("(left out to save space; the failing test and the failure output show "
+                 "what is required)", failing, feedback[-2500:], focus),
+            make("(left out)", failing[:1200], feedback[-1200:], focus),
+        ]
+    else:
+        prompts += [
+            make(short, failing, feedback[-2500:]),
+            make("(left out to save space; the failing test and the failure output below show "
+                 "what is required)", failing, feedback[-2500:]),
+            make("(left out)", failing[:1200], feedback[-1200:]),
+        ]
+    return prompts
 
 
 def defined_names(code: str):
@@ -678,6 +961,11 @@ def command_words(code: str, limit: int = 15) -> list:
     return out[:limit]
 
 
+def source_files(folder: Path) -> list:
+    """The program's own modules in a folder (not tests, not scratch files)."""
+    return [p for p in folder.glob("*.py") if not p.name.startswith(("test_", "_"))]
+
+
 def _probe(sandbox: Path, args: list, stdin_text: str):
     """Run app.py once in an empty sandbox with a throwaway home folder, so the
     program can never touch the user's real files. Returns the finished process,
@@ -690,7 +978,7 @@ def _probe(sandbox: Path, args: list, stdin_text: str):
         cmd = [sys.executable, "-B", "app.py", *args]
     import shutil
     for item in sandbox.iterdir():  # every probe starts from a clean slate
-        if item.name != "app.py":
+        if item.suffix != ".py" or item.name.startswith("_"):
             if item.is_dir():
                 shutil.rmtree(item, ignore_errors=True)
             else:
@@ -744,7 +1032,8 @@ def stress_test(workdir: Path) -> list:
     started = time.time()
     with tempfile.TemporaryDirectory() as tmp:
         sandbox = Path(tmp)
-        shutil.copy(app, sandbox / "app.py")
+        for src in source_files(workdir):
+            shutil.copy(src, sandbox / src.name)
         for label, args, stdin_text in probes:
             if len(findings) >= 5 or time.time() - started > STRESS_BUDGET:
                 break
@@ -918,18 +1207,407 @@ def run_design_check(design: str, idea: str, outdir: Path):
     return None
 
 
-def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -> bool:
-    outdir.mkdir(parents=True, exist_ok=True)
+ANSWER_HELPERS = '''\
+import os, shutil, subprocess, sys, tempfile
+from pathlib import Path
+_SB = Path(tempfile.mkdtemp())
+for _src in Path(__file__).resolve().parent.glob("*.py"):
+    if not _src.name.startswith(("test_", "_")):
+        shutil.copy(_src, _SB / _src.name)
+(_SB / "_home").mkdir(exist_ok=True)
 
-    if design_file:
-        design = Path(design_file).read_text(encoding="utf-8")
+
+def _wipe():
+    for p in _SB.iterdir():
+        if p.suffix == ".py" and not p.name.startswith("_"):
+            continue
+        shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink()
+    (_SB / "_home").mkdir(exist_ok=True)
+
+
+def run_app(stdin_text="", args=(), fresh=True):
+    if fresh:
+        _wipe()
+    home = str(_SB / "_home")
+    try:
+        p = subprocess.run(
+            [sys.executable, "-B", "app.py", *map(str, args)], cwd=_SB, input=stdin_text,
+            capture_output=True, text=True, timeout=8, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                 "HOME": home, "USERPROFILE": home})
+    except subprocess.TimeoutExpired:
+        return "<<the program did not finish within 8 seconds>>"
+    return p.stdout + p.stderr
+
+
+def load_app():
+    import importlib.util
+    os.chdir(_SB)
+    os.environ["HOME"] = os.environ["USERPROFILE"] = str(_SB / "_home")
+    spec = importlib.util.spec_from_file_location("app_under_check", _SB / "app.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _norm(s):
+    return " ".join(str(s).split()).lower()
+
+
+def _same(a, b):
+    if a == b:
+        return True
+    try:
+        return abs(float(a) - float(b)) <= 0.006
+    except ValueError:
+        return False
+
+
+def _report(ok, label, expected, source, got):
+    if ok:
+        print("OK " + label)
+    else:
+        shown = " | ".join(str(got).strip().splitlines())[:220]
+        print(f"MISMATCH {label}: expected {expected!r} (because: {source}); the program gave: {shown!r}")
+
+
+def expect_line(label, output, expected, source=""):
+    want = _norm(expected)
+    lines = [_norm(l.lstrip("> ")) for l in str(output).splitlines()]
+    _report(any(_same(l, want) for l in lines), label, expected, source, output)
+
+
+def expect_in(label, output, text, source=""):
+    _report(_norm(text) in _norm(output), label, text, source, output)
+
+
+def expect_not_in(label, output, text, source=""):
+    _report(_norm(text) not in _norm(output), label, "no '" + str(text) + "'", source, output)
+
+
+def expect(label, actual, expected, source=""):
+    try:
+        got = actual() if callable(actual) else actual
+    except Exception as e:
+        got = f"{type(e).__name__}: {e}"
+    ok = got == expected
+    if not ok:
+        try:
+            ok = abs(float(got) - float(expected)) <= 0.006
+        except (TypeError, ValueError):
+            pass
+    _report(ok, label, expected, source, got)
+
+'''
+
+
+def run_answer_check(idea: str, design: str, code: str, outdir: Path, script_text=None):
+    """Have an independent Examiner (who has not seen the code) write exact
+    expected answers from the idea and design, run them against app.py, and
+    return (mismatch lines or None if it could not run, the script text)."""
+    error = ""
+    for attempt in range(2):
+        if script_text is None:
+            sigs = signatures_only(code)
+            base = (f"Original idea: {idea}\n\nDesign:\n{design}\n\n"
+                    f"Function signatures of app.py:\n```python\n{sigs}\n```")
+            short = (f"Original idea: {idea}\n\nDesign:\n{without_examples(design)}\n\n"
+                     f"Function signatures of app.py:\n```python\n{sigs}\n```")
+            note = (f"\n\nYour previous script failed to run:\n{error}\nReturn the corrected full script."
+                    if error else "")
+            try:
+                script_text = extract_code(examiner.ask(base + note, fallbacks=[short + note]))
+            except (ApiError, requests.RequestException) as exc:
+                log("AnswerCheck", f"skipped (could not reach the model: {str(exc)[:120]})")
+                return None, None
+        script = outdir / "_answer_check.py"
+        script.write_text(ANSWER_HELPERS + "\n" + script_text, encoding="utf-8")
+        try:
+            p = subprocess.run(
+                [sys.executable, "-I", "-B", str(script.resolve())], cwd=outdir, capture_output=True,
+                text=True, timeout=120, encoding="utf-8", errors="replace",
+                env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            )
+        except subprocess.TimeoutExpired:
+            error, script_text = "The script ran for more than 120 seconds.", None
+            continue
+        lines = [l for l in p.stdout.splitlines() if l.startswith(("OK ", "MISMATCH "))]
+        if p.returncode != 0 or not lines:
+            error, script_text = (p.stderr or "It printed no OK/MISMATCH lines.")[-800:], None
+            continue
+        return [l for l in lines if l.startswith("MISMATCH")], script_text
+    log("AnswerCheck", "skipped (the checking script would not run: " + " ".join(error.split())[-160:] + ")")
+    return None, None
+
+
+def shrink_design(design: str, idea: str, requirements: str) -> str:
+    """Designs that are too long make every later request too big for a free tier.
+    Ask the Architect to cut it down to a smaller core (one attempt)."""
+    if not DESIGN_BUDGET or len(design) <= DESIGN_BUDGET:
+        return design
+    log("System", f"The design is {len(design)} characters, too big for the free tier's request "
+                  f"limit; asking the Architect to cut it to a smaller core.")
+    try:
+        smaller = architect.ask(
+            f"Original idea: {idea}\n\nRequirements:\n{requirements}\n\nYour design is too long:\n"
+            f"{design}\n\nRewrite it as a SMALLER program: keep only the core operations the "
+            f"idea needs (at most 6 functions), drop persistence and extras unless the idea "
+            f"requires them, and keep the whole design under {DESIGN_BUDGET // 6} words. "
+            f"Keep the 'Worked examples' and 'Example session' sections. Return the full design.",
+            fallbacks=[f"Original idea: {idea}\n\nWrite a very small design (at most 6 functions, "
+                       f"under {DESIGN_BUDGET // 6} words) with 'Worked examples' and "
+                       f"'Example session' sections for: {requirements}"])
+        return smaller if len(smaller) < len(design) else design
+    except (ApiError, requests.RequestException) as error:
+        log("System", f"Could not shrink the design ({str(error)[:100]}); continuing with it.")
+        return design
+
+
+PLAN_MAX_MODULES = 5
+
+
+def parse_plan(text: str):
+    """Read the Planner's JSON. Returns (plan, None) or (None, what is wrong)."""
+    found = re.search(r"\{.*\}", text, re.S)
+    if not found:
+        return None, "there is no JSON object in the reply"
+    try:
+        plan = json.loads(found.group(0))
+    except ValueError as exc:
+        return None, f"it is not valid JSON ({exc})"
+    mods = plan.get("modules") if isinstance(plan, dict) else None
+    if not isinstance(mods, list) or not 2 <= len(mods) <= PLAN_MAX_MODULES:
+        return None, f"'modules' must be a list of 2 to {PLAN_MAX_MODULES} modules"
+    stdlib = getattr(sys, "stdlib_module_names", set())
+    seen = set()
+    for i, mod in enumerate(mods):
+        if not isinstance(mod, dict):
+            return None, "every module must be a JSON object"
+        last = i == len(mods) - 1
+        name = "app" if last else str(mod.get("name", "")).strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,24}", name):
+            return None, f"module name {name!r} must be lowercase letters, digits and underscores"
+        if name in seen or (not last and (name in stdlib or name in ("app", "test", "tests"))):
+            return None, (f"module name {name!r} is used twice or clashes with a Python library "
+                          f"module; choose a different name")
+        api = mod.get("api")
+        if not isinstance(api, list) or not api or not all(isinstance(a, str) for a in api):
+            return None, f"module {name!r} needs 'api': a list of function signature strings"
+        seen.add(name)
+        mod["name"] = name
+        mod["purpose"] = str(mod.get("purpose", "")).strip()
+    reqs = plan.get("requirements")
+    plan["requirements"] = [str(r) for r in reqs] if isinstance(reqs, list) else []
+    return plan, None
+
+
+def plan_text(plan: dict) -> str:
+    lines = ["Requirements:"] + [f"- {r}" for r in plan["requirements"]]
+    lines.append("Modules (in build order; each may import only the ones before it):")
+    for n, mod in enumerate(plan["modules"], 1):
+        lines.append(f"{n}. {mod['name']}.py - {mod['purpose']}")
+        lines += [f"   - {a}" for a in mod["api"]]
+    return "\n".join(lines)
+
+
+def plan_from_text(text: str):
+    """Rebuild a plan from PLAN.md (written by the first version of project mode)."""
+    plan = {"requirements": [], "modules": []}
+    for line in text.splitlines():
+        m = re.match(r"\d+\.\s+(\w+)\.py - (.*)", line)
+        if m:
+            plan["modules"].append({"name": m.group(1), "purpose": m.group(2), "api": []})
+        elif line.startswith("   - ") and plan["modules"]:
+            plan["modules"][-1]["api"].append(line[5:])
+        elif line.startswith("- "):
+            plan["requirements"].append(line[2:])
+    return plan
+
+
+def rename_module_in_tests(text: str, name: str) -> str:
+    """Tests are written against `app` while a module is built on its own; give
+    them the module's real name."""
+    if name == "app":
+        return text
+    text = re.sub(r"^([ \t]*)import app\b[ \t]*(#.*)?$", rf"\1import {name} as app  \2", text, flags=re.M)
+    text = re.sub(r"\bfrom app import\b", f"from {name} import", text)
+    return re.sub(r"""(["'])app\.""", rf"\1{name}.", text)
+
+
+def module_rules(name: str, entry: bool, siblings: str) -> str:
+    out = [f"\n\n## Where this file fits\n\nThis is the module `{name}.py` of a multi-file program."]
+    if siblings:
+        out.append("These modules are already written and tested. Import from them with "
+                   "`from <module> import <name>` using exactly these names; never redefine "
+                   "or copy them:\n\n" + siblings)
+    if entry:
+        out.append("This is the entry module: it holds `main` and ends with "
+                   '`if __name__ == "__main__": ...`. It does the command-line handling '
+                   "and printing and uses the modules above for the real work.")
+    else:
+        out.append("This is a LIBRARY module: it has no `main`, never prints, never reads "
+                   "input and has no `if __name__` block. Errors are raised as exceptions "
+                   "with clear messages. The program's other files will import it.")
+    return "\n\n".join(out) + "\n"
+
+
+def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
+    """Build a bigger program as several small modules, each designed, written and
+    tested on its own, so every request stays small enough for a free tier."""
+    import shutil
+    outdir.mkdir(parents=True, exist_ok=True)
+    plan, error = None, ""
+    saved = outdir / "PLAN.json"
+    if resume and (saved.exists() or (outdir / "PLAN.md").exists()):
+        try:
+            if saved.exists():
+                plan, error = parse_plan(saved.read_text(encoding="utf-8"))
+            else:
+                plan, error = parse_plan(json.dumps(
+                    plan_from_text((outdir / "PLAN.md").read_text(encoding="utf-8"))))
+        except OSError:
+            plan = None
+        if plan:
+            log("System", "Resuming the saved plan; modules that already passed are kept.")
+    for _ in range(0 if plan else 2):
+        try:
+            reply = planner.ask(f"Idea: {idea}" + (
+                f"\n\nYour previous reply was rejected because {error}. Return corrected JSON only."
+                if error else ""))
+        except (ApiError, requests.RequestException) as exc:
+            log("System", f"Could not plan the project ({str(exc)[:120]}).")
+            return False
+        plan, error = parse_plan(reply)
+        if plan:
+            break
+    if not plan:
+        log("System", f"The project plan was unusable ({error}); building a single file instead.")
+        return build(idea, outdir, allow_project=False)
+    mods = plan["modules"]
+    (outdir / "PLAN.md").write_text(plan_text(plan) + "\n", encoding="utf-8")
+    saved.write_text(json.dumps(plan, indent=1), encoding="utf-8")
+    log("System", f"Project plan: {len(mods)} modules: " + ", ".join(m["name"] for m in mods))
+    (outdir / ".gitignore").write_text("_modules/\n__pycache__/\n*.pyc\n", encoding="utf-8")
+
+    results = []
+    for mod in mods:
+        name = mod["name"]
+        entry = name == "app"
+        if resume and (outdir / f"{name}.py").exists() and not (outdir / "_modules" / name).exists():
+            log("System", f"--- Module {len(results) + 1}/{len(mods)}: {name}.py already passed; keeping it ---")
+            results.append((name, True))
+            continue
+        log("System", f"--- Module {len(results) + 1}/{len(mods)}: {name}.py ---")
+        siblings = "\n\n".join(
+            f"### {p.name}\n```python\n{signatures_only(p.read_text(encoding='utf-8'))}\n```"
+            for p in sorted(source_files(outdir)))
+        try:
+            spec = clean_design(module_architect.ask(
+                f"Original idea: {idea}\n\nProgram plan:\n{plan_text(plan)}\n\n"
+                + (f"Modules already written (real signatures):\n{siblings}\n\n" if siblings else "")
+                + f"Design ONLY the module `{name}` ("
+                + ("the entry module with main" if entry else "a library module") + ")."))
+        except (ApiError, requests.RequestException) as exc:
+            log("System", f"Could not design {name}.py ({str(exc)[:120]}); stopping the project here.")
+            results.append((name, False))
+            break
+        spec += module_rules(name, entry, siblings)
+        sandbox = outdir / "_modules" / name
+        shutil.rmtree(sandbox, ignore_errors=True)
+        sandbox.mkdir(parents=True)
+        for p in source_files(outdir):
+            shutil.copy(p, sandbox / p.name)
+        try:
+            ok = build(idea if entry else f"{idea} (this is only the '{name}' module of a larger program: a library "
+                       f"module with no main and no command line; test its functions directly)",
+                       sandbox, design_text=spec, module=name)
+        except (ApiError, requests.RequestException) as exc:
+            log("System", f"Stopped while building {name}.py ({str(exc)[:120]}).")
+            ok = False
+            results.append((name, ok))
+            if (sandbox / "app.py").exists():
+                shutil.copy(sandbox / "app.py", outdir / f"{name}.py")
+            break
+        if (sandbox / "app.py").exists():
+            shutil.copy(sandbox / "app.py", outdir / f"{name}.py")
+        if (sandbox / "test_app.py").exists():
+            tests = (sandbox / "test_app.py").read_text(encoding="utf-8")
+            (outdir / f"test_{name}.py").write_text(rename_module_in_tests(tests, name), encoding="utf-8")
+        results.append((name, ok))
+        if ok:
+            shutil.rmtree(sandbox, ignore_errors=True)
+        git_commit(outdir, f"Add module {name}")
+
+    try:
+        (outdir / "_modules").rmdir()  # only succeeds when empty (every module passed)
+    except OSError:
+        pass
+    complete = len(results) == len(mods)
+    ok_modules = complete and all(ok for _, ok in results)
+    tests_ok, output = run_tests(outdir) if source_files(outdir) else (False, "no modules were written")
+    (outdir / "last_test_output.txt").write_text(output, encoding="utf-8")
+    log("System", "All tests of the finished project " + ("pass." if tests_ok else "do NOT all pass; see last_test_output.txt"))
+
+    files = ", ".join(p.name for p in sorted(source_files(outdir)))
+    entry_path = outdir / "app.py"
+    entry_code = entry_path.read_text(encoding="utf-8") if entry_path.exists() else ""
+    shown = entry_code if len(entry_code) < 5000 else signatures_only(entry_code)
+    try:
+        readme = clean_design(docs.ask(
+            f"Requirements:\n{plan_text(plan)}\n\nThe program is made of these files: {files}. "
+            f"Run it with `python app.py` and run the tests with `python -m unittest` (they are "
+            f"test_<module>.py files). Describe the files briefly.\n\napp.py:\n```python\n{shown}```",
+            fallbacks=[f"Requirements:\n{plan_text(plan)}\n\nThe program is made of these files: "
+                       f"{files}. Run it with `python app.py`; tests: `python -m unittest`."]))
+    except (ApiError, requests.RequestException):
+        readme = "# " + idea + "\n\n" + plan_text(plan) + "\n"
+    if not (ok_modules and tests_ok):
+        bad = [n for n, ok in results if not ok] + [m["name"] for m in mods[len(results):]]
+        readme = (f"> **Warning:** this project is not fully resolved"
+                  + (f" (modules with problems: {', '.join(bad)})" if bad else "")
+                  + ". See last_test_output.txt.\n\n") + readme
+    (outdir / "README.md").write_text(readme, encoding="utf-8")
+    git_commit(outdir, "Add README")
+    if ok_modules and tests_ok:
+        log("System", f"Done. Project in {outdir} ({len(mods)} modules, all tests pass).")
+    else:
+        log("System", f"Done, but NOT fully resolved. See {outdir / 'last_test_output.txt'} "
+                      f"and the folders in {outdir / '_modules'}.")
+    return ok_modules and tests_ok
+
+
+def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
+          design_text: str = "", module: str = "", allow_project: bool = True,
+          resume: bool = False) -> bool:
+    """module: set when this call builds ONE module of a multi-file project (the
+    module is built and tested as app.py in its own folder). A library module
+    (anything but the entry module 'app') skips the stress test, answer check and
+    review, and writes no README."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    library = module not in ("", "app")
+    commit = (lambda *args: None) if module else git_commit
+    clean_here = (lambda text: drop_main_tests(clean_tests(text))) if library else clean_tests
+
+    if design_file or design_text:
+        design = design_text or Path(design_file).read_text(encoding="utf-8")
         requirements = design  # the design already says what the program must do
-        log("System", f"Using the design in {design_file} (skipping PM, Architect and review)")
+        if not module:
+            log("System", f"Using the design in {design_file} (skipping PM, Architect and review)")
         (outdir / "DESIGN.md").write_text(design, encoding="utf-8")
     else:
+        if (PROJECT_MODE == "always" or resume) and allow_project:
+            log("System", "Multi-file mode: planning the modules.")
+            return build_project(idea, outdir, resume)
         requirements = pm.ask(f"Idea: {idea}")
         design = architect.ask(f"Original idea: {idea}\n\nRequirements:\n{requirements}")
         (outdir / "DESIGN.md").write_text(design, encoding="utf-8")  # keep the draft even if a later step fails
+        if (allow_project and PROJECT_MODE == "auto" and DESIGN_BUDGET
+                and len(design) > DESIGN_BUDGET):
+            log("System", f"The design is {len(design)} characters: too big for one file on a "
+                          f"free tier. Switching to a multi-file project.")
+            return build_project(idea, outdir)
+        design = shrink_design(design, idea, requirements)
+        (outdir / "DESIGN.md").write_text(design, encoding="utf-8")
         critique = "OK"
         if DESIGN_REVIEW:
             critique = design_reviewer.ask(
@@ -946,7 +1624,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
             except (ApiError, requests.RequestException) as error:
                 log("DesignReview", f"could not rewrite the design ({str(error)[:150]}). "
                                     f"Keeping the first design; check it yourself.")
-        design = clean_design(design)
+        design = clean_design(shrink_design(design, idea, requirements))
         for round_no in range(1, DESIGN_CHECKS + 1):
             mismatches = run_design_check(design, idea, outdir)
             if mismatches is None:
@@ -989,9 +1667,9 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
 
     design = clean_design(design)
     (outdir / "DESIGN.md").write_text(design, encoding="utf-8")
-    for problem in design_warnings(design):
+    for problem in ([] if library else design_warnings(design)):
         log("DesignCheck", f"WARNING: {problem}")
-    if design_file and DESIGN_CHECKS:
+    if design_file and DESIGN_CHECKS and not module:
         found = run_design_check(design, idea, outdir)
         if found:
             log("DesignCheck", f"WARNING: {len(found)} mismatch(es) in your design file:")
@@ -1000,9 +1678,25 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
         elif found is not None:
             log("DesignCheck", "every worked example and count matches the rules")
 
-    code = extract_code(developer.ask(f"Original idea: {idea}\n\nDesign:\n{design}"))
+    code = drop_self_imports(
+        reorder_constants(extract_code(developer.ask(f"Original idea: {idea}\n\nDesign:\n{design}"))),
+        module)
+    found = static_problems(code)
+    if found:
+        log("System", "The first app.py looks damaged or cut off: " + "; ".join(found)[:200])
+        try:
+            repair = extract_code(developer.ask(
+                f"Original idea: {idea}\n\nCurrent app.py:\n```python\n{code}```\n\n"
+                "Problems found:\n- " + "\n- ".join(found) + "\n\nReturn ONLY the top-level "
+                "functions that are broken or missing, each one COMPLETE, plus the final "
+                '`if __name__ == "__main__":` block if it is missing, in ONE python code block. '
+                "Do not repeat functions that are fine."
+            ))
+            code = drop_self_imports(apply_reply(code, repair), module)
+        except (ApiError, requests.RequestException) as exc:
+            log("System", f"Could not repair it now ({str(exc)[:100]}); the test loop will try.")
     (outdir / "app.py").write_text(code, encoding="utf-8")
-    test_code = clean_tests(
+    test_code = clean_here(
         tester.ask(
             f"Original idea: {idea}\n\nDesign:\n{design}\n\nCurrent app.py:\n```python\n{code}```",
             fallbacks=[
@@ -1012,12 +1706,13 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
         )
     )
     (outdir / "test_app.py").write_text(test_code, encoding="utf-8")
-    git_commit(outdir, "Initial version")
+    commit(outdir, "Initial version")
 
     approved = False
     review_skipped = False
     last_stress = []  # stress-test problems found in the latest round
     last_output = ""
+    answer_script, answer_checked, answer_fixes, answer_open = None, None, 0, []
     best = None  # (tests passing, code, test_code) for the best version seen so far
     for rnd in range(1, MAX_ROUNDS + 1):
         log("System", f"Round {rnd}/{MAX_ROUNDS}: running tests")
@@ -1046,7 +1741,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
         test_names, blocks = set(), {}
         if ok:
             best = (passed_count(output), code, test_code)
-            last_stress = stress_test(outdir) if STRESS else []
+            last_stress = stress_test(outdir) if STRESS and not library else []
             if last_stress:
                 log("System", f"Tests passed, but the stress test found {len(last_stress)} "
                               f"problem(s) with hostile input:")
@@ -1061,14 +1756,46 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                     "and make sure no input can ever show a traceback or hang the program. "
                     "Keep every function the tests use."
                 )
+            elif library:
+                approved = True  # a library module is done when its own tests pass
+                break
             else:
-                log("System", "Tests" + (" and stress test" if STRESS else "") +
-                              " passed. Sending to review.")
-                verdict = reviewer.ask(f"```python\n{code}```")
-                if verdict.strip().upper().startswith("APPROVED"):
-                    approved = True
-                    break
-                code_feedback = f"The reviewer requested changes:\n{verdict}"
+                answer_found = []
+                if ANSWER_CHECKS and not USE_DOCKER and code != answer_checked:
+                    answer_checked = code
+                    log("System", "Tests and stress test passed. Checking exact answers "
+                                  "(an examiner who has not seen the code)...")
+                    answer_found, answer_script = run_answer_check(idea, design, code, outdir,
+                                                                   answer_script)
+                    answer_found = answer_found or []
+                    answer_open = list(answer_found)
+                    for line in answer_found:
+                        log("AnswerCheck", line[:200])
+                    if not answer_found and answer_script:
+                        log("AnswerCheck", "every expected answer matched")
+                if answer_found and answer_fixes < ANSWER_CHECKS:
+                    answer_fixes += 1
+                    log("System", f"{len(answer_found)} wrong answer(s); asking the Developer to fix "
+                                  f"them ({answer_fixes}/{ANSWER_CHECKS}).")
+                    verdict = (
+                        "An independent examiner, who has not seen your code, worked out the "
+                        "correct answers from the idea and the design. The program gave "
+                        "different answers here:\n\n" + "\n".join(answer_found) +
+                        "\n\nFix the program so these come out right, and keep everything "
+                        "else working. Follow the design's rules where an expectation seems to "
+                        "contradict them.")
+                    code_feedback = verdict
+                else:
+                    if answer_found:
+                        log("System", "Some answers still differ after the allowed fix rounds; "
+                                      "see ANSWER_CHECK.txt. Sending to review.")
+                    else:
+                        log("System", "Sending to review.")
+                    verdict = reviewer.ask(f"```python\n{code}```")
+                    if verdict.strip().upper().startswith("APPROVED"):
+                        approved = True
+                        break
+                    code_feedback = f"The reviewer requested changes:\n{verdict}"
         else:
             last_stress = []
             blocks = failure_blocks(output)
@@ -1084,6 +1811,10 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
             code_feedback = "The tests failed with this output:\n" + (
                 "\n\n".join(shown) if shown else output[-3000:]
             ) + warning
+            damage = static_problems(code)
+            if damage:
+                code_feedback += ("\n\nA structural check of app.py also found these problems; fix "
+                                  "them too:\n- " + "\n- ".join(damage))
             if output == last_output:
                 code_feedback += (
                     "\n\nWARNING: your previous fix produced the exact same failure. "
@@ -1110,7 +1841,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                     f"values. Return the full test_app.py."
                 )
             try:
-                test_code = clean_tests(
+                test_code = clean_here(
                     tester.ask(
                         tester_fix_prompt(design, code, test_code),
                         fallbacks=[
@@ -1125,13 +1856,13 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                 log("System", "The test-file fix does not fit the free tier's request size; "
                               "keeping the current tests and fixing the code instead.")
             (outdir / "test_app.py").write_text(test_code, encoding="utf-8")
-            git_commit(outdir, f"Fix tests, round {rnd}")
+            commit(outdir, f"Fix tests, round {rnd}")
 
         if fix_code:
             prompts = fix_prompts(design, code, test_code, code_feedback)
             try:
                 reply_code = extract_code(developer.ask(prompts[0], fallbacks=prompts[1:]))
-                new_code = merge_patch(code, reply_code) or reply_code
+                new_code = drop_self_imports(apply_reply(code, reply_code), module)
             except ApiError as error:
                 if ok and "413" in str(error):
                     # The tests already pass; only the reviewer's suggestions do not fit the
@@ -1161,7 +1892,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
                             f"COMPLETE and valid Python, in one code block."
                         )
                     )
-                    new_code = merge_patch(code, retry_code) or retry_code
+                    new_code = drop_self_imports(apply_reply(code, retry_code), module)
                     problem = fix_problem(code, new_code, test_code)
                 except ApiError as error:
                     if "413" not in str(error):
@@ -1172,7 +1903,18 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
             else:
                 code = new_code
             (outdir / "app.py").write_text(code, encoding="utf-8")
-            git_commit(outdir, f"Fix code, round {rnd}")
+            commit(outdir, f"Fix code, round {rnd}")
+
+    if module and not approved and ok and not last_stress:
+        notes = verdict if isinstance(verdict, str) else ""
+        if notes:
+            (outdir / "REVIEW_NOTES.md").write_text("# Requested changes (not applied)\n\n" + notes + "\n", encoding="utf-8")
+        log("System", "All tests pass; the reviewer's remaining requests were not applied "
+                      "(see REVIEW_NOTES.md in the module folder).")
+        approved = True
+    if module:
+        log("System", f"Module {module}: " + ("tests pass." if approved else "NOT fully resolved."))
+        return approved
 
     readme = docs.ask(
         f"Requirements:\n{requirements}\n\napp.py:\n```python\n{code}```",
@@ -1183,6 +1925,13 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
         ],
     )
     readme = clean_design(readme)
+    if answer_open:
+        (outdir / "ANSWER_CHECK.txt").write_text(
+            "Answers the independent examiner expected but the final program did not give "
+            "(the examiner can be wrong too; check each by hand):\n\n" + "\n".join(answer_open) + "\n",
+            encoding="utf-8")
+        readme = ("> **Warning:** an independent check found answers that differ from what the "
+                  "idea and design imply. See ANSWER_CHECK.txt.\n\n") + readme
     if review_skipped:
         readme = (
             "> **Note:** all tests pass, but the reviewer's requested changes could not be "
@@ -1196,7 +1945,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "") -
             "See last_test_output.txt. Parts of this README may be inaccurate.\n\n"
         ) + readme
     (outdir / "README.md").write_text(readme, encoding="utf-8")
-    git_commit(outdir, "Add README" if approved else "Add README (unresolved issues)")
+    commit(outdir, "Add README" if approved else "Add README (unresolved issues)")
 
     if approved:
         log("System", f"Done. Output in {outdir} (passed tests and review).")
@@ -1220,9 +1969,20 @@ def main() -> None:
                         help="output folder (default: team_output/<name made from the idea>)")
     parser.add_argument("--pause-after-design", action="store_true",
                         help="stop after the design so you can check and edit DESIGN.md")
+    parser.add_argument("--project", action="store_true",
+                        help="build several small files (always); default: only for big ideas")
+    parser.add_argument("--resume", action="store_true",
+                        help="with --out <existing project folder>: redo only the modules that failed")
+    parser.add_argument("--single", action="store_true",
+                        help="always build one file, even for a big idea")
     parser.add_argument("--design", default="",
                         help="use this design file instead of generating one")
     args = parser.parse_args()
+    global PROJECT_MODE
+    if args.project:
+        PROJECT_MODE = "always"
+    elif args.single:
+        PROJECT_MODE = "never"
 
     idea = args.idea.strip()
     if not idea:
@@ -1249,7 +2009,9 @@ def main() -> None:
                       "8 GB of RAM). To use Groq, set TEAM_API_BASE, TEAM_API_KEY and TEAM_MODEL "
                       "in your .env file (or in this terminal). " + DOTENV_NOTE)
     try:
-        build(idea, out_dir, args.pause_after_design, args.design)
+        if args.resume and not args.out:
+            sys.exit("--resume needs --out <the project folder>, e.g. --out command_line_matrix_calculator_app3")
+        build(idea, out_dir, args.pause_after_design, args.design, resume=args.resume)
     except ApiError as error:
         sys.exit(f"API error: {error}\nFiles written so far are in {args.out}.")
     except requests.ReadTimeout:
