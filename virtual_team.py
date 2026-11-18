@@ -38,9 +38,11 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 import time
 from pathlib import Path
 
+warnings.filterwarnings("ignore", category=SyntaxWarning)  # checking generated code is not the user's concern
 import requests
 
 # Load settings and keys from a local .env file (never committed to git).
@@ -313,16 +315,22 @@ planner = Agent(
     'program does, how invalid input is handled, how data is stored if it is"], '
     '"modules": [{"name": "snake_case_name", "purpose": "one sentence", "api": '
     '["def function_name(arg: type) -> type  # one-line behaviour and which '
-    'errors it raises"]}]}. Rules: 2 to 5 modules, in dependency order (a module '
+    'errors it raises"]}], "data_formats": ["the EXACT shape of every data structure '
+    'that one module hands to another, with every field name and type, e.g. a token '
+    'is a dict {\'type\': \'heading\', \'level\': int, \'text\': str}; use [] if '
+    'modules only pass plain numbers or strings"]}. Rules: 2 to 6 modules, in dependency order (a module '
     "may import only modules listed before it); the LAST module must be named "
     '"app": it holds main(argv=None) and the command-line handling and printing; '
     "every other module is a library of plain functions that never prints or "
-    "reads input; at most 6 functions per module, each with an exact signature "
+    "reads input; at most 4 functions per module (split anything bigger into more modules), each with an exact signature "
     "with types; put shared things (such as the exception class) in the first "
     "module; use standard library only; never name a module like a standard "
     "library module (no parser, types, string, json, logging, io, ...); every "
     "function a module needs from another module must appear in that module's "
-    "api list. Keep the program as small as the idea allows.",
+    "api list. Whenever modules pass structured data to each other (tokens, records, "
+    "dicts, lists of dicts) the 'data_formats' entry must pin it down exactly, because "
+    "the module that creates the data and the module that reads it are written "
+    "separately. Keep the program as small as the idea allows.",
 )
 module_architect = Agent(
     "Architect",
@@ -331,11 +339,16 @@ module_architect = Agent(
     "you together with the plan and the real signatures of the modules already "
     "written. Implement exactly the functions the plan lists for this module "
     "with the same names and signatures; import from earlier modules with "
-    "`from <module> import <name>`, never redefine them. The file is named "
+    "`from <module> import <name>` (always absolute, NEVER relative like `from .common "
+    "import x`; the files are plain scripts in one folder), never redefine them. The file is named "
     "after the module, not app.py. A library module has no main, prints "
     "nothing and reads no input, so leave out the 'Example session' section "
     "and give 4-6 'Worked examples' lines for its functions. The entry module "
-    "app has main and an 'Example session'. Keep the design under 900 words.",
+    "app has main and an 'Example session'. When the plan has 'Shared data formats', "
+    "copy the ones this module creates or reads into your design word for word and "
+    "follow them exactly. Keep the design under 700 words. "
+    "Quote every error message EXACTLY, in the form `raises ValueError('exact message')`; "
+    "the Developer and Tester will both copy those words, so never leave a message vague.",
 )
 
 design_reviewer = Agent(
@@ -413,7 +426,8 @@ examiner = Agent(
 developer = Agent(
     "Developer",
     "You are a careful Python developer. Write the COMPLETE contents of app.py "
-    "following the design exactly (same names and signatures). Standard "
+    "following the design exactly (same names and signatures; when the design "
+    "quotes an error message, use exactly those words). Standard "
     "library only. Keep it simple (plain functions, no needless class "
     "hierarchies) and make sure main() works end to end using the functions "
     "you write. Follow the design's data tables, formulas and input formats "
@@ -461,6 +475,15 @@ tester = Agent(
     "use the network. For every invalid-input rule in the design (nan, inf, "
     "empty input, zero, negative, unknown command) add a test that the program "
     "reports a clean error instead of raising an exception. "
+    "On Windows an open file cannot be deleted: when a test creates a temporary "
+    "file, write it inside a `with` block (or close it) before the program or "
+    "the cleanup uses it, and prefer tempfile.TemporaryDirectory(). To replace a "
+    "function that app takes from another module, patch it where app looks it up: "
+    "patch('parser.parse_markdown') if app calls parser.parse_markdown(...), or "
+    "patch('app.parse_markdown') if app did `from parser import parse_markdown`. "
+    "Assert the exact text of an error message only when the design quotes it "
+    "exactly; otherwise assert only the exception type or that the output "
+    "starts with 'Error'. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 reviewer = Agent(
@@ -514,6 +537,13 @@ def failure_blocks(output: str) -> dict:
         m = re.match(r"\s*(?:FAIL|ERROR): (\w+)", chunk)
         if m:
             blocks[m.group(1)] = chunk.strip()
+    if not blocks:
+        # Text the program printed without a final newline can glue itself to the
+        # separator line; find the failures by their headings instead.
+        marks = list(re.finditer(r"(?:FAIL|ERROR): (\w+) \(", output))
+        for i, m in enumerate(marks):
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(output)
+            blocks.setdefault(m.group(1), output[m.start():end].strip())
     return blocks
 
 
@@ -534,6 +564,7 @@ def looks_like_test_bug(block: str) -> bool:
         re.search(r"^(?:NameError|ImportError|ModuleNotFoundError|SyntaxError|IndentationError)\b", block, re.M)
         or re.search(r"^AttributeError: module '(?!app')", block, re.M)
         or re.search(r"^AttributeError: '_io\.TextIOWrapper' object has no attribute 'getvalue'", block, re.M)
+        or re.search(r"^PermissionError: \[WinError 32\]", block, re.M)  # test left a temp file open
     )
 
 
@@ -672,12 +703,40 @@ def merge_patch(code: str, patch: str):
     return merged
 
 
+def absolutize_imports(code: str) -> str:
+    """The program's files are plain scripts in one folder, so `from .common import x`
+    (a relative import) can never work. Make such imports absolute."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    rel = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level > 0]
+    if not rel:
+        return code
+    lines = code.splitlines()
+    for n in sorted(rel, key=lambda n: -n.lineno):
+        indent = lines[n.lineno - 1][:len(lines[n.lineno - 1]) - len(lines[n.lineno - 1].lstrip())]
+        if n.module:
+            n.level = 0
+            new = ast.unparse(n)
+        else:  # from . import a, b as c
+            new = "import " + ", ".join(a.name + (f" as {a.asname}" if a.asname else "") for a in n.names)
+        lines[n.lineno - 1:n.end_lineno] = [indent + new]
+    result = "\n".join(lines) + "\n"
+    try:
+        ast.parse(result)
+    except SyntaxError:
+        return code
+    return result
+
+
 def drop_self_imports(code: str, module: str) -> str:
     """While a module is built on its own it is saved as app.py, so a line such as
     `from <its own name> import x` can never work (and a patch of whole functions
     cannot remove an import line). Remove such lines; the names are defined in the file."""
     if not module:
         return code
+    code = absolutize_imports(code)
     try:
         tree = ast.parse(code)
     except SyntaxError:
@@ -774,6 +833,14 @@ def reorder_constants(code: str) -> str:
     return result
 
 
+def norm_output(output: str) -> str:
+    """Test output with the parts that change on every run (timings, temp names,
+    memory addresses) removed, so two runs of the same failure compare equal."""
+    text = re.sub(r"in \d+\.\d+s", "", output)
+    text = re.sub(r"tmp\w+", "tmp", text)
+    return re.sub(r"0x[0-9a-fA-F]+", "0x", text)
+
+
 def apply_reply(code: str, reply: str) -> str:
     """Turn a Developer reply (usually a patch, sometimes a whole file) into the new
     app.py. A reply that is neither a usable patch nor a whole file is ignored,
@@ -781,9 +848,16 @@ def apply_reply(code: str, reply: str) -> str:
     merged = merge_patch(code, reply)
     if merged is None:
         try:
-            new_tree, old_tree = ast.parse(reply), ast.parse(code)
+            new_tree = ast.parse(reply)
         except SyntaxError:
             return code
+        try:
+            old_tree = ast.parse(code)
+        except SyntaxError:
+            # The current file is broken (cut off, bad syntax), so nothing can be merged
+            # into it: a reply that is a complete, valid file replaces it.
+            return reorder_constants(reply) if any(
+                isinstance(n, (ast.FunctionDef, ast.ClassDef)) for n in new_tree.body) else code
         defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         new_defs = {n.name for n in new_tree.body if isinstance(n, defs)}
         old_defs = {n.name for n in old_tree.body if isinstance(n, defs)}
@@ -922,12 +996,16 @@ def run_tests(workdir: Path) -> tuple[bool, str]:
         p = subprocess.run(
             cmd, cwd=workdir, capture_output=True, text=True, timeout=TEST_TIMEOUT,
             encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL,  # a test that reads input sees end-of-input, never waits for a keyboard
             env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
         )
         output = (p.stdout + p.stderr)[-20000:]
         return p.returncode == 0, output
     except subprocess.TimeoutExpired:
-        return False, f"Tests timed out after {TEST_TIMEOUT}s (infinite loop?)."
+        return False, (f"Tests timed out after {TEST_TIMEOUT}s. Most likely some test or the "
+                       f"program waits for input (input() or sys.stdin.read()) or loops forever. "
+                       f"Tests must supply any input themselves (patch sys.stdin or builtins.input); "
+                       f"the program must read input normally and never guess whether input is waiting.")
 
 
 # --------------------------------------------------------------------------
@@ -1335,7 +1413,21 @@ def run_answer_check(idea: str, design: str, code: str, outdir: Path, script_tex
         if p.returncode != 0 or not lines:
             error, script_text = (p.stderr or "It printed no OK/MISMATCH lines.")[-800:], None
             continue
-        return [l for l in lines if l.startswith("MISMATCH")], script_text
+        known = " ".join((idea + " " + design).lower().split())
+        kept = []
+        for l in lines:
+            if not l.startswith("MISMATCH"):
+                continue
+            m = re.search(r": expected (.+?) \(because:", l)
+            try:
+                want = ast.literal_eval(m.group(1)) if m else None
+            except (ValueError, SyntaxError):
+                want = None
+            if (isinstance(want, str) and len(re.findall(r"[A-Za-z]", want)) >= 4
+                    and " ".join(want.lower().split()) not in known):
+                continue  # invented wording, not something the idea or design states
+            kept.append(l)
+        return kept, script_text
     log("AnswerCheck", "skipped (the checking script would not run: " + " ".join(error.split())[-160:] + ")")
     return None, None
 
@@ -1363,7 +1455,7 @@ def shrink_design(design: str, idea: str, requirements: str) -> str:
         return design
 
 
-PLAN_MAX_MODULES = 5
+PLAN_MAX_MODULES = 6
 
 
 def parse_plan(text: str):
@@ -1398,11 +1490,16 @@ def parse_plan(text: str):
         mod["purpose"] = str(mod.get("purpose", "")).strip()
     reqs = plan.get("requirements")
     plan["requirements"] = [str(r) for r in reqs] if isinstance(reqs, list) else []
+    fmts = plan.get("data_formats")
+    plan["data_formats"] = [str(f) for f in fmts] if isinstance(fmts, list) else []
     return plan, None
 
 
 def plan_text(plan: dict) -> str:
     lines = ["Requirements:"] + [f"- {r}" for r in plan["requirements"]]
+    if plan.get("data_formats"):
+        lines.append("Shared data formats (every module must follow these EXACTLY):")
+        lines += [f"* {f}" for f in plan["data_formats"]]
     lines.append("Modules (in build order; each may import only the ones before it):")
     for n, mod in enumerate(plan["modules"], 1):
         lines.append(f"{n}. {mod['name']}.py - {mod['purpose']}")
@@ -1412,8 +1509,11 @@ def plan_text(plan: dict) -> str:
 
 def plan_from_text(text: str):
     """Rebuild a plan from PLAN.md (written by the first version of project mode)."""
-    plan = {"requirements": [], "modules": []}
+    plan = {"requirements": [], "modules": [], "data_formats": []}
     for line in text.splitlines():
+        if line.startswith("* "):
+            plan["data_formats"].append(line[2:])
+            continue
         m = re.match(r"\d+\.\s+(\w+)\.py - (.*)", line)
         if m:
             plan["modules"].append({"name": m.group(1), "purpose": m.group(2), "api": []})
@@ -1424,22 +1524,41 @@ def plan_from_text(text: str):
     return plan
 
 
+def tests_to_sandbox(text: str, module: str) -> str:
+    """The design calls a module by its real name, so the Tester writes
+    `import parser_utils`; while the module is built alone it is called app."""
+    if module in ("", "app"):
+        return text
+    m = re.escape(module)
+    text = re.sub(rf"^([ \t]*)import {m}\b(?!\s+as)[ \t]*(#.*)?$", rf"\1import app as {module}  \2", text, flags=re.M)
+    text = re.sub(rf"^([ \t]*)import {m}\s+as\s+(\w+)", r"\1import app as \2", text, flags=re.M)
+    text = re.sub(rf"\bfrom {m} import\b", "from app import", text)
+    return re.sub(rf"""(["']){m}\.""", r"\1app.", text)
+
+
 def rename_module_in_tests(text: str, name: str) -> str:
     """Tests are written against `app` while a module is built on its own; give
     them the module's real name."""
     if name == "app":
         return text
-    text = re.sub(r"^([ \t]*)import app\b[ \t]*(#.*)?$", rf"\1import {name} as app  \2", text, flags=re.M)
+    text = re.sub(r"^([ \t]*)import app\s+as\s+(\w+)", rf"\1import {name} as \2", text, flags=re.M)
+    text = re.sub(r"^([ \t]*)import app\b(?!\s+as)[ \t]*(#.*)?$", rf"\1import {name} as app  \2", text, flags=re.M)
     text = re.sub(r"\bfrom app import\b", f"from {name} import", text)
     return re.sub(r"""(["'])app\.""", rf"\1{name}.", text)
 
 
 def module_rules(name: str, entry: bool, siblings: str) -> str:
     out = [f"\n\n## Where this file fits\n\nThis is the module `{name}.py` of a multi-file program."]
-    if siblings:
+    if siblings and entry:
+        out.append("These modules are already written and tested. Import each one with "
+                   "`import <module>` and call `<module>.<name>(...)` using exactly these "
+                   "names (never `from <module> import <name>`, so that tests can patch "
+                   "`<module>.<name>`); never redefine or copy them:\n\n" + siblings)
+    elif siblings:
         out.append("These modules are already written and tested. Import from them with "
-                   "`from <module> import <name>` using exactly these names; never redefine "
-                   "or copy them:\n\n" + siblings)
+                   "`from <module> import <name>` (absolute, NEVER a relative import such as "
+                   "`from .common import x`: the files are plain scripts in one folder) using "
+                   "exactly these names; never redefine or copy them:\n\n" + siblings)
     if entry:
         out.append("This is the entry module: it holds `main` and ends with "
                    '`if __name__ == "__main__": ...`. It does the command-line handling '
@@ -1449,6 +1568,16 @@ def module_rules(name: str, entry: bool, siblings: str) -> str:
                    "input and has no `if __name__` block. Errors are raised as exceptions "
                    "with clear messages. The program's other files will import it.")
     return "\n\n".join(out) + "\n"
+
+
+def required_names(api: list) -> list:
+    """Top-level function and class names a module promises in the plan."""
+    names = []
+    for line in api:
+        m = re.match(r"\s*(def|class)\s+(\w+)", line)
+        if m and not m.group(2).startswith("_") and not (m.group(1) == "def" and "(self" in line):
+            names.append(m.group(2))
+    return names
 
 
 def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
@@ -1520,7 +1649,8 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
         try:
             ok = build(idea if entry else f"{idea} (this is only the '{name}' module of a larger program: a library "
                        f"module with no main and no command line; test its functions directly)",
-                       sandbox, design_text=spec, module=name)
+                       sandbox, design_text=spec, module=name,
+                       required_names=required_names(mod["api"]))
         except (ApiError, requests.RequestException) as exc:
             log("System", f"Stopped while building {name}.py ({str(exc)[:120]}).")
             ok = False
@@ -1578,15 +1708,22 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
 
 def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
           design_text: str = "", module: str = "", allow_project: bool = True,
-          resume: bool = False) -> bool:
+          resume: bool = False, required_names=()) -> bool:
     """module: set when this call builds ONE module of a multi-file project (the
     module is built and tested as app.py in its own folder). A library module
     (anything but the entry module 'app') skips the stress test, answer check and
     review, and writes no README."""
     outdir.mkdir(parents=True, exist_ok=True)
     library = module not in ("", "app")
+    if module and module != "app":
+        # While built alone the module is app.py, but its design (and so its tests) call
+        # it by its real name. Make that name import the very same module object.
+        (outdir / f"{module}.py").write_text(
+            "import sys\nimport app\nsys.modules[__name__] = app\n", encoding="utf-8")
     commit = (lambda *args: None) if module else git_commit
-    clean_here = (lambda text: drop_main_tests(clean_tests(text))) if library else clean_tests
+    def clean_here(text):
+        text = tests_to_sandbox(clean_tests(text), module)
+        return drop_main_tests(text) if library else text
 
     if design_file or design_text:
         design = design_text or Path(design_file).read_text(encoding="utf-8")
@@ -1712,6 +1849,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
     review_skipped = False
     last_stress = []  # stress-test problems found in the latest round
     last_output = ""
+    stall = 0  # how many fixes in a row left the test output exactly the same
     answer_script, answer_checked, answer_fixes, answer_open = None, None, 0, []
     best = None  # (tests passing, code, test_code) for the best version seen so far
     for rnd in range(1, MAX_ROUNDS + 1):
@@ -1741,8 +1879,17 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
         test_names, blocks = set(), {}
         if ok:
             best = (passed_count(output), code, test_code)
-            last_stress = stress_test(outdir) if STRESS and not library else []
-            if last_stress:
+            missing_api = [n for n in required_names if n not in (defined_names(code) or set())]
+            last_stress = [] if missing_api else (stress_test(outdir) if STRESS and not library else [])
+            if missing_api:
+                log("System", "Tests pass, but these functions from the plan are missing: "
+                              + ", ".join(missing_api))
+                verdict = ("The plan says this module must define these top-level functions or "
+                           "classes, and other modules import them by exactly these names, but "
+                           "they are missing: " + ", ".join(missing_api) + ". Add them with the "
+                           "exact names and signatures from the design.")
+                code_feedback = verdict
+            elif last_stress:
                 log("System", f"Tests passed, but the stress test found {len(last_stress)} "
                               f"problem(s) with hostile input:")
                 for line in last_stress:
@@ -1805,23 +1952,49 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
             code_names = set(blocks) - test_names
             fix_tests = bool(test_names)
             fix_code = bool(code_names) or not fix_tests
+            escalated = False
+            if fix_tests and not fix_code and norm_output(output) == last_output:
+                # The Tester has not been able to fix this; the real cause may be that the
+                # code lacks something the tests rely on, so let the Developer see it too.
+                fix_code, escalated = True, True
+                log("System", "The same test-file failure repeats; asking the Developer too.")
+            if not blocks:
+                log("System", "Could not find individual failures in the test output; its end is: "
+                              + " ".join(output.strip().split())[-300:])
+            stall = stall + 1 if norm_output(output) == last_output else 0
+            audit = False
+            if stall >= 1 and not fix_tests and blocks:
+                # The Developer's fix changed nothing. Either the code cannot satisfy the
+                # test, or the test itself is wrong: let the Tester check it against the design.
+                audit, fix_tests, test_names = True, True, set(blocks)
             log("System", f"Tests failed: {len(blocks)} failing | "
-                          f"{len(test_names)} test-file mistakes")
+                          f"{len(test_names) if not audit else 0} test-file mistakes"
+                          + (" | same failure again: the Tester will check the test against the design"
+                             if audit else ""))
+            if stall >= 3:
+                log("System", "No progress after repeated fixes; stopping this part to save "
+                              "tokens. See last_test_output.txt.")
+                break
             shown = [blocks[n][-800:] for n in sorted(code_names)]
             code_feedback = "The tests failed with this output:\n" + (
                 "\n\n".join(shown) if shown else output[-3000:]
             ) + warning
+            if escalated:
+                code_feedback += ("\n\nThe test file could not be fixed by changing the tests. "
+                                  "Check whether the tests import or call something this module "
+                                  "should provide (a function, class or constant from the design) "
+                                  "and add or correct it.")
             damage = static_problems(code)
             if damage:
                 code_feedback += ("\n\nA structural check of app.py also found these problems; fix "
                                   "them too:\n- " + "\n- ".join(damage))
-            if output == last_output:
+            if norm_output(output) == last_output:
                 code_feedback += (
                     "\n\nWARNING: your previous fix produced the exact same failure. "
                     "Do not make a tiny edit. Re-read the design and rewrite the "
                     "failing part with a different approach."
                 )
-            last_output = output
+            last_output = norm_output(output)
 
         if rnd == MAX_ROUNDS:
             break  # out of retries; keep the latest versions
@@ -1835,10 +2008,18 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
                     f"Current test_app.py:\n```python\n{t}```\n\n"
                     f"These tests need attention: {names}\n\n"
                     f"Their failure output:\n{evidence}\n\n"
+                    + (
+                    f"The Developer could not make these tests pass in several attempts, so "
+                    f"the TEST may be wrong. Compare each failing test with the design: if "
+                    f"its expected value or behavior is not exactly what the design's rules "
+                    f"and worked examples say, correct the test. If a test matches the "
+                    f"design, leave it unchanged. Return the full test_app.py."
+                    if audit else
                     f"If the failure is a mistake in the test file itself (a missing "
                     f"import, an undefined name, wrong use of unittest.mock or "
                     f"sys.stdout), fix the test file. Do not change any expected "
                     f"values. Return the full test_app.py."
+                    )
                 )
             try:
                 test_code = clean_here(
