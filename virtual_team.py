@@ -419,8 +419,9 @@ examiner = Agent(
     "negative), rounding, totals and sorting, and data that must survive a "
     "restart (two run_app calls, the second with fresh=False). Feed the program "
     "the way the design's example session does, and end interactive input with "
-    "the program's quit command so it exits. Write 15 to 30 terse checks, each "
-    "on its own line, about 80 lines in all. Print nothing yourself. "
+    "the program's quit command so it exits. Write 10 to 16 terse checks, each "
+    "on its own line, at most 45 lines in all (a longer reply gets cut off and is "
+    "useless). Use plain ASCII only in the script. Print nothing yourself. "
     "Reply with exactly one ```python code block and nothing else.",
 )
 developer = Agent(
@@ -1269,7 +1270,7 @@ def run_design_check(design: str, idea: str, outdir: Path):
         script.write_text(CHECK_HELPERS + "\n" + extract_code(reply), encoding="utf-8")
         try:
             p = subprocess.run(
-                [sys.executable, "-I", "-B", str(script.resolve())], cwd=outdir, capture_output=True,
+                [sys.executable, "-X", "utf8", "-I", "-B", str(script.resolve())], cwd=outdir, capture_output=True,
                 text=True, timeout=20, encoding="utf-8", errors="replace",
                 env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
             )
@@ -1402,7 +1403,7 @@ def run_answer_check(idea: str, design: str, code: str, outdir: Path, script_tex
         script.write_text(ANSWER_HELPERS + "\n" + script_text, encoding="utf-8")
         try:
             p = subprocess.run(
-                [sys.executable, "-I", "-B", str(script.resolve())], cwd=outdir, capture_output=True,
+                [sys.executable, "-X", "utf8", "-I", "-B", str(script.resolve())], cwd=outdir, capture_output=True,
                 text=True, timeout=120, encoding="utf-8", errors="replace",
                 env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
             )
@@ -1483,8 +1484,14 @@ def parse_plan(text: str):
             return None, (f"module name {name!r} is used twice or clashes with a Python library "
                           f"module; choose a different name")
         api = mod.get("api")
-        if not isinstance(api, list) or not api or not all(isinstance(a, str) for a in api):
-            return None, f"module {name!r} needs 'api': a list of function signature strings"
+        if api is None or api == "":
+            api = []
+        if isinstance(api, str):
+            api = [api]
+        if not isinstance(api, list):
+            return None, f"module {name!r} needs 'api': a list of signature strings"
+        api = [a if isinstance(a, str) else json.dumps(a) for a in api]
+        mod["api"] = api
         seen.add(name)
         mod["name"] = name
         mod["purpose"] = str(mod.get("purpose", "")).strip()
