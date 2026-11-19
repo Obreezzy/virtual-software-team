@@ -488,6 +488,10 @@ tester = Agent(
     "function that app takes from another module, patch it where app looks it up: "
     "patch('parser.parse_markdown') if app calls parser.parse_markdown(...), or "
     "patch('app.parse_markdown') if app did `from parser import parse_markdown`. "
+    "NEVER assign to sys.modules and never use patch.dict on sys.modules: "
+    "replacing a whole module leaks into the other test files that run in the "
+    "same process and breaks them. Replace functions only with mock.patch used "
+    "as a context manager or started in setUp and stopped in tearDown. "
     "Assert the exact text of an error message only when the design quotes it "
     "exactly; otherwise assert only the exception type or that the output "
     "starts with 'Error'. "
@@ -737,7 +741,35 @@ def absolutize_imports(code: str) -> str:
     return result
 
 
+def drop_self_assignments(code: str) -> str:
+    """Remove top-level lines such as `NAME = NAME`: they raise NameError at import
+    (a leftover of a bad fix) and change nothing when the name already exists."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    bad = [n for n in tree.body
+           if isinstance(n, ast.Assign) and len(n.targets) == 1
+           and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.Name)
+           and n.targets[0].id == n.value.id]
+    if not bad:
+        return code
+    lines = code.splitlines()
+    for n in sorted(bad, key=lambda n: -n.lineno):
+        del lines[n.lineno - 1:n.end_lineno]
+    result = "\n".join(lines) + "\n"
+    try:
+        ast.parse(result)
+    except SyntaxError:
+        return code
+    return result
+
+
 def drop_self_imports(code: str, module: str) -> str:
+    return drop_self_assignments(_drop_self_imports_only(code, module))
+
+
+def _drop_self_imports_only(code: str, module: str) -> str:
     """While a module is built on its own it is saved as app.py, so a line such as
     `from <its own name> import x` can never work (and a patch of whole functions
     cannot remove an import line). Remove such lines; the names are defined in the file."""
@@ -1327,6 +1359,10 @@ def read_file(name):
 
 
 def run_app(stdin_text="", args=(), fresh=True, files=None):
+    if isinstance(stdin_text, (list, tuple)):
+        stdin_text = "\\n".join(map(str, stdin_text)) + "\\n"
+    if isinstance(args, str):
+        args = args.split()
     if fresh:
         _wipe()
     _put(files)
@@ -1411,18 +1447,38 @@ def call_problems(code: str, outdir: Path) -> list:
         tree = ast.parse(code)
     except SyntaxError:
         return []
-    sigs, defined = {}, {}
+    sigs, defined, dict_returns, trees = {}, {}, set(), {}
+    dict_types = {"dict", "Dict", "Mapping", "MutableMapping", "OrderedDict", "defaultdict"}
     for p in source_files(outdir):
         if p.name == "app.py":
             continue
         try:
-            mod = ast.parse(p.read_text(encoding="utf-8"))
+            trees[p.stem] = ast.parse(p.read_text(encoding="utf-8"))
         except (OSError, SyntaxError):
             continue
+    for mod in trees.values():  # TypedDict classes and aliases of dict types
+        for n in mod.body:
+            if isinstance(n, ast.ClassDef) and any(
+                    (isinstance(b, ast.Name) and b.id == "TypedDict")
+                    or (isinstance(b, ast.Attribute) and b.attr == "TypedDict") for b in n.bases):
+                dict_types.add(n.name)
+            elif (isinstance(n, ast.Assign) and len(n.targets) == 1
+                  and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.Subscript)
+                  and isinstance(n.value.value, ast.Name) and n.value.value.id in dict_types):
+                dict_types.add(n.targets[0].id)
+
+    def is_dict_annotation(node):
+        if isinstance(node, ast.Subscript):
+            node = node.value
+        return isinstance(node, ast.Name) and node.id in dict_types
+    for stem, mod in trees.items():
+        p = Path(stem + ".py")
         names = set()
         for n in mod.body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names.add(n.name)
+                if n.returns is not None and is_dict_annotation(n.returns):
+                    dict_returns.add((stem, n.name))
                 a = n.args
                 pos = a.posonlyargs + a.args
                 sigs[(p.stem, n.name)] = ([x.arg for x in pos + a.kwonlyargs],
@@ -1473,6 +1529,29 @@ def call_problems(code: str, outdir: Path) -> list:
         if not vararg and not starred and len(n.args) > npos:
             problems.append(f"{label} takes at most {npos} positional argument(s) but is called "
                             f"with {len(n.args)}")
+    # a dictionary returned by another module must be read with ["key"], not .key
+    holders, other = {}, set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            var, val, key = n.targets[0].id, n.value, None
+            if isinstance(val, ast.Call):
+                f = val.func
+                if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in aliases:
+                    key = (aliases[f.value.id], f.attr)
+                elif isinstance(f, ast.Name) and f.id in imported:
+                    key = imported[f.id]
+            if key in dict_returns:
+                holders[var] = key
+            else:
+                other.add(var)
+    dict_methods = set(dir(dict))
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id in holders and n.value.id not in other
+                and n.attr not in dict_methods):
+            key = holders[n.value.id]
+            problems.append(f"'{n.value.id}.{n.attr}': '{n.value.id}' is a dictionary returned by "
+                            f"{key[0]}.{key[1]}(); read it as {n.value.id}['{n.attr}'], not with a dot")
     return sorted(set(problems))
 
 
@@ -1715,26 +1794,34 @@ def required_names(api: list) -> list:
 
 
 def cli_help(outdir: Path) -> str:
-    """The real --help output of app.py (and of each subcommand), so the README
-    shows the syntax the program really has."""
+    """What the program itself says about how to use it: its output with no
+    arguments, with -h and with --help (and with `<command> -h` when it uses
+    sub-commands), so the README shows the syntax the program really has."""
     import subprocess
+    import tempfile
 
     def run(args):
+        home = tempfile.mkdtemp()  # the program must not touch the real home folder
         try:
             done = subprocess.run([sys.executable, "-X", "utf8", "-B", "app.py"] + args,
                                   cwd=outdir, capture_output=True, text=True, timeout=20,
-                                  stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
-            return (done.stdout or done.stderr or "").strip()
+                                  stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                                  env={**os.environ, "HOME": home, "USERPROFILE": home})
+            return ((done.stdout or "") + (done.stderr or "")).strip()
         except (OSError, subprocess.SubprocessError):
             return ""
-    top = run(["-h"])
-    if not top:
-        return ""
-    parts = [f"$ python app.py -h\n{top}"]
+    seen, parts = set(), []
+    for args in ([], ["-h"], ["--help"]):
+        text = run(args)
+        if text and text not in seen and "Traceback" not in text:
+            seen.add(text)
+            parts.append(f"$ python app.py {' '.join(args)}".rstrip() + f"\n{text}")
+    top = next((t for t in seen if re.search(r"\{([a-z0-9_,-]+)\}", t)), "")
     found = re.search(r"\{([a-z0-9_,-]+)\}", top)
     for sub_name in (found.group(1).split(",") if found else [])[:8]:
         text = run([sub_name, "-h"])
-        if text:
+        if text and text not in seen:
+            seen.add(text)
             parts.append(f"$ python app.py {sub_name} -h\n{text}")
     return "\n\n".join(parts)[:3500]
 
@@ -1843,7 +1930,7 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
     files = ", ".join(p.name for p in sorted(source_files(outdir)))
     entry_path = outdir / "app.py"
     entry_code = entry_path.read_text(encoding="utf-8") if entry_path.exists() else ""
-    shown = entry_code if len(entry_code) < 5000 else signatures_only(entry_code)
+    shown = entry_code if len(entry_code) < 9000 else signatures_only(entry_code)
     helptext = cli_help(outdir)
     how = (f"\n\nThe program's REAL command-line help (copy this syntax exactly into the "
            f"usage examples; do not invent options):\n```\n{helptext}\n```") if helptext else ""
@@ -1851,7 +1938,9 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
         readme = clean_design(docs.ask(
             f"Requirements:\n{plan_text(plan)}\n\nThe program is made of these files: {files}. "
             f"Run it with `python app.py` and run the tests with `python -m unittest` (they are "
-            f"test_<module>.py files). Describe the files briefly.{how}\n\napp.py:\n```python\n{shown}```",
+            f"test_<module>.py files). Describe the files briefly. Use ONLY the command names, "
+            f"options and messages that appear in app.py or in its help text below, and state where "
+            f"the program saves its data (the default file path in the code).{how}\n\napp.py:\n```python\n{shown}```",
             fallbacks=[f"Requirements:\n{plan_text(plan)}\n\nThe program is made of these files: "
                        f"{files}. Run it with `python app.py`; tests: `python -m unittest`."]))
     except (ApiError, requests.RequestException):

@@ -1,0 +1,119 @@
+﻿python : .............................EEEEEEEEEE
+At line:1 char:1
++ python -m unittest 2>&1 | Out-File full.txt -Encoding utf8
++ ~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (.............................EEEEEEEEEE:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+======================================================================
+ERROR: test_get_default_path (test_storage.TestStorage.test_get_default_path)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 18, in test_get_default_path
+    path = get_default_path()
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_load_data_malformed_json_raises (test_storage.TestStorage.test_load_data_malformed_json_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 46, in test_load_data_malformed_json_raises
+    load_data(bad_json)
+    ~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_load_data_malformed_structure_raises (test_storage.TestStorage.test_load_data_malformed_structure_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 56, in test_load_data_malformed_structure_raises
+    load_data(malformed)
+    ~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_load_data_missing_file_returns_empty (test_storage.TestStorage.test_load_data_missing_file_returns_empty)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 26, in test_load_data_missing_file_returns_empty
+    result = load_data(missing)
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_load_data_unreadable_file_raises (test_storage.TestStorage.test_load_data_unreadable_file_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 37, in test_load_data_unreadable_file_raises
+    load_data(file_path)
+    ~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_load_data_valid (test_storage.TestStorage.test_load_data_valid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 65, in test_load_data_valid
+    result = load_data(good)
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_save_data_malformed_data_raises (test_storage.TestStorage.test_save_data_malformed_data_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 82, in test_save_data_malformed_data_raises
+    save_data(out_path, malformed)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_save_data_rename_failure_raises (test_storage.TestStorage.test_save_data_rename_failure_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 104, in test_save_data_rename_failure_raises
+    save_data(out_path, data)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_save_data_successful (test_storage.TestStorage.test_save_data_successful)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 72, in test_save_data_successful
+    save_data(out_path, data)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+======================================================================
+ERROR: test_save_data_unwritable_directory_raises (test_storage.TestStorage.test_save_data_unwritable_directory_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_storage.py", line 94, in test_save_data_unwritable_directory_raises
+    save_data(out_path, data)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\Virtual Software Team\command_line_habit_streak_trac_app2\test_app.py", line 15, in _placeholder
+    raise NotImplementedError("storage function not patched")
+NotImplementedError: storage function not patched
+
+----------------------------------------------------------------------
+Ran 39 tests in 0.040s
+
+FAILED (errors=10)
+Added habit "exercise"
