@@ -1,0 +1,28 @@
+{
+  "expenses": [
+    {
+      "amount": 90.0,
+      "description": "Dinner",
+      "participants": [
+        "Alice",
+        "Bob",
+        "Cara"
+      ],
+      "payer": "Alice"
+    },
+    {
+      "amount": 30.0,
+      "description": "Taxi",
+      "participants": [
+        "Bob",
+        "Cara"
+      ],
+      "payer": "Bob"
+    }
+  ],
+  "people": [
+    "Alice",
+    "Bob",
+    "Cara"
+  ]
+}

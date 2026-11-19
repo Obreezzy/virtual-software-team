@@ -1,0 +1,19 @@
+{
+  "expenses": [
+    {
+      "amount": 100.0,
+      "description": "Rounding",
+      "participants": [
+        "Alice",
+        "Bob",
+        "Cara"
+      ],
+      "payer": "Alice"
+    }
+  ],
+  "people": [
+    "Alice",
+    "Bob",
+    "Cara"
+  ]
+}

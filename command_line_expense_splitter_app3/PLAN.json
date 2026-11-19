@@ -1,0 +1,64 @@
+{
+ "requirements": [
+  "Record people who share expenses.",
+  "Add an expense with payer, amount, participants and description.",
+  "Persist data in a JSON file between runs.",
+  "Compute a minimal set of payments that settles all debts.",
+  "Handle invalid input by raising a clear exception, never crashing.",
+  "Command\u2011line interface supports adding people, adding expenses, and showing settlements.",
+  "Data is never lost; file is written atomically.",
+  "All library modules are pure and produce no console output."
+ ],
+ "modules": [
+  {
+   "name": "common",
+   "purpose": "Defines shared exception and simple validation helpers.",
+   "api": [
+    "def validate_amount(amount: float) -> None  # raises ExpenseError if amount <= 0"
+   ]
+  },
+  {
+   "name": "storage",
+   "purpose": "Load and save the ledger JSON file.",
+   "api": [
+    "def load_ledger(path: str) -> dict  # returns Ledger, raises ExpenseError on I/O or malformed JSON",
+    "def save_ledger(path: str, ledger: dict) -> None  # writes Ledger atomically, raises ExpenseError on failure"
+   ]
+  },
+  {
+   "name": "people",
+   "purpose": "Manage the list of participants in the ledger.",
+   "api": [
+    "def add_person(ledger: dict, name: str) -> None  # adds name to ledger['people'], raises ExpenseError on duplicate or empty",
+    "def list_people(ledger: dict) -> List[str]  # returns a sorted copy of ledger['people']"
+   ]
+  },
+  {
+   "name": "expenses",
+   "purpose": "Add and list expense records.",
+   "api": [
+    "def add_expense(ledger: dict, payer: str, amount: float, participants: List[str], description: str) -> None  # validates and appends an Expense, raises ExpenseError on errors",
+    "def list_expenses(ledger: dict) -> List[dict]  # returns a shallow copy of ledger['expenses']"
+   ]
+  },
+  {
+   "name": "settlement",
+   "purpose": "Calculate the minimal payment plan to settle all debts.",
+   "api": [
+    "def compute_settlements(ledger: dict) -> List[dict]  # returns a list of Payments, raises ExpenseError if settlement impossible"
+   ]
+  },
+  {
+   "name": "app",
+   "purpose": "Command\u2011line interface, argument parsing and user interaction.",
+   "api": [
+    "def main(argv: List[str] | None = None) -> None  # parses commands, uses other modules, prints results, handles ExpenseError"
+   ]
+  }
+ ],
+ "data_formats": [
+  "Ledger = {'people': List[str], 'expenses': List[Expense]}",
+  "Expense = {'payer': str, 'amount': float, 'participants': List[str], 'description': str}",
+  "Payment = {'from': str, 'to': str, 'amount': float}"
+ ]
+}
