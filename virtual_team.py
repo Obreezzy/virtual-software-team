@@ -398,9 +398,13 @@ examiner = Agent(
     "ONE self-contained Python script (standard library only) that tests the "
     "finished program by running it and comparing what it prints with exact "
     "expected answers that YOU derive. Helpers already exist; do NOT define them: "
-    "run_app(stdin_text='', args=(), fresh=True) runs `python app.py` and returns "
-    "everything it printed (fresh=False keeps files saved by the previous run, "
-    "to test saving and restarting); load_app() imports app.py as a module so you "
+    "run_app(stdin_text='', args=(), fresh=True, files=None) runs `python app.py` "
+    "and returns everything it printed (fresh=False keeps files saved by the "
+    "previous run, to test saving and restarting). To give the program an input "
+    "file (a questions file, a CSV, a data file) pass files={'name.json': 'text'}: "
+    "it is written next to app.py before the run, so give the program that plain "
+    "file name (never write files yourself, they would be deleted); read_file('name') "
+    "returns the text of a file the program saved ('' if missing); load_app() imports app.py as a module so you "
     "can call its functions; expect_line(label, output, expected, source) passes "
     "when some output line equals expected (a leading '> ' prompt is ignored; "
     "numbers are compared with a small tolerance); expect_in(label, output, "
@@ -434,6 +438,8 @@ developer = Agent(
     "you write. Follow the design's data tables, formulas and input formats "
     "literally (keywords such as 'to' are part of the format) and never "
     "hard-code per-case constants that a table or formula already gives. "
+    "Open every user-supplied text, JSON or CSV file for reading with "
+    "encoding='utf-8-sig' (Windows editors add an invisible byte-order mark). "
     "Wrap the body of main() so that end of input (EOFError) and Ctrl+C "
     "(KeyboardInterrupt) end the program cleanly and no input can ever show a "
     "traceback. Use decimal.Decimal for money. Check math.isfinite() or "
@@ -1304,9 +1310,26 @@ def _wipe():
     (_SB / "_home").mkdir(exist_ok=True)
 
 
-def run_app(stdin_text="", args=(), fresh=True):
+def _put(files):
+    for name, text in dict(files or {}).items():
+        target = (_SB / str(name)).resolve()
+        if _SB.resolve() in target.parents:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(text), encoding="utf-8")
+
+
+def read_file(name):
+    """Text of a file the program left next to app.py ('' if it does not exist)."""
+    try:
+        return (_SB / str(name)).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def run_app(stdin_text="", args=(), fresh=True, files=None):
     if fresh:
         _wipe()
+    _put(files)
     home = str(_SB / "_home")
     try:
         p = subprocess.run(
@@ -1380,6 +1403,98 @@ def expect(label, actual, expected, source=""):
 '''
 
 
+def call_problems(code: str, outdir: Path) -> list:
+    """Static check of an entry module against its sibling modules: wrong keyword
+    names, too many positional arguments, and imports or calls of names that the
+    other module does not define. No model call is needed."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    sigs, defined = {}, {}
+    for p in source_files(outdir):
+        if p.name == "app.py":
+            continue
+        try:
+            mod = ast.parse(p.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        names = set()
+        for n in mod.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(n.name)
+                a = n.args
+                pos = a.posonlyargs + a.args
+                sigs[(p.stem, n.name)] = ([x.arg for x in pos + a.kwonlyargs],
+                                         a.kwarg is not None, a.vararg is not None, len(pos))
+            elif isinstance(n, ast.ClassDef):
+                names.add(n.name)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                names.update(t.id for t in targets if isinstance(t, ast.Name))
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                names.update((al.asname or al.name).split(".")[0] for al in n.names)
+        defined[p.stem] = names
+    aliases, imported, problems = {}, {}, []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                if al.name in defined:
+                    aliases[al.asname or al.name] = al.name
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in defined:
+            for al in n.names:
+                if al.name == "*":
+                    continue
+                if al.name not in defined[n.module]:
+                    problems.append(f"{n.module}.py does not define '{al.name}' (it defines: "
+                                    + ", ".join(sorted(x for x in defined[n.module] if not x.startswith("_"))) + ")")
+                imported[al.asname or al.name] = (n.module, al.name)
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        f, key = n.func, None
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in aliases:
+            key = (aliases[f.value.id], f.attr)
+            if f.attr not in defined[key[0]]:
+                problems.append(f"{key[0]}.py does not define '{f.attr}'")
+                continue
+        elif isinstance(f, ast.Name) and f.id in imported:
+            key = imported[f.id]
+        if key is None or key not in sigs:
+            continue
+        names, varkw, vararg, npos = sigs[key]
+        label = f"{key[0]}.{key[1]}()"
+        if not varkw:
+            for kw in n.keywords:
+                if kw.arg and kw.arg not in names:
+                    problems.append(f"{label} has no parameter named '{kw.arg}'; its parameters "
+                                    f"are: {', '.join(names) or 'none'}")
+        starred = any(isinstance(a, ast.Starred) for a in n.args)
+        if not vararg and not starred and len(n.args) > npos:
+            problems.append(f"{label} takes at most {npos} positional argument(s) but is called "
+                            f"with {len(n.args)}")
+    return sorted(set(problems))
+
+
+def salvage_script(text: str) -> str:
+    """A reply cut off at the output limit ends in a broken line. The checks are
+    independent lines, so drop the broken tail and keep the complete checks."""
+    try:
+        ast.parse(text)
+        return text
+    except SyntaxError:
+        pass
+    lines = text.splitlines()
+    while lines:
+        lines.pop()
+        try:
+            ast.parse("\n".join(lines))
+            return "\n".join(lines) + "\n"
+        except SyntaxError:
+            continue
+    return text
+
+
 def run_answer_check(idea: str, design: str, code: str, outdir: Path, script_text=None):
     """Have an independent Examiner (who has not seen the code) write exact
     expected answers from the idea and design, run them against app.py, and
@@ -1400,6 +1515,7 @@ def run_answer_check(idea: str, design: str, code: str, outdir: Path, script_tex
                 log("AnswerCheck", f"skipped (could not reach the model: {str(exc)[:120]})")
                 return None, None
         script = outdir / "_answer_check.py"
+        script_text = salvage_script(script_text)
         script.write_text(ANSWER_HELPERS + "\n" + script_text, encoding="utf-8")
         try:
             p = subprocess.run(
@@ -1428,6 +1544,14 @@ def run_answer_check(idea: str, design: str, code: str, outdir: Path, script_tex
                     and " ".join(want.lower().split()) not in known):
                 continue  # invented wording, not something the idea or design states
             kept.append(l)
+        gave = {(re.search(r"the program gave: (.*)$", l) or [None, l])[1] for l in kept}
+        if len(kept) >= 3 and len(gave) == 1 and re.search(
+                r"not found|no such file|does not exist|cannot open|could not open",
+                next(iter(gave)), re.I):
+            log("AnswerCheck", "skipped (every check got the same 'file not found' reply, so the "
+                               "checking script probably failed to set up its input file; not "
+                               "blaming the program)")
+            return None, None
         return kept, script_text
     log("AnswerCheck", "skipped (the checking script would not run: " + " ".join(error.split())[-160:] + ")")
     return None, None
@@ -1569,7 +1693,10 @@ def module_rules(name: str, entry: bool, siblings: str) -> str:
     if entry:
         out.append("This is the entry module: it holds `main` and ends with "
                    '`if __name__ == "__main__": ...`. It does the command-line handling '
-                   "and printing and uses the modules above for the real work.")
+                   "and printing and uses the modules above for the real work. Call every "
+                   "function of the modules above with KEYWORD arguments (name=value, using "
+                   "the exact parameter names from the signatures), never by position, and "
+                   "read dictionary keys exactly as the modules' code and docstrings spell them.")
     else:
         out.append("This is a LIBRARY module: it has no `main`, never prints, never reads "
                    "input and has no `if __name__` block. Errors are raised as exceptions "
@@ -1585,6 +1712,31 @@ def required_names(api: list) -> list:
         if m and not m.group(2).startswith("_") and not (m.group(1) == "def" and "(self" in line):
             names.append(m.group(2))
     return names
+
+
+def cli_help(outdir: Path) -> str:
+    """The real --help output of app.py (and of each subcommand), so the README
+    shows the syntax the program really has."""
+    import subprocess
+
+    def run(args):
+        try:
+            done = subprocess.run([sys.executable, "-X", "utf8", "-B", "app.py"] + args,
+                                  cwd=outdir, capture_output=True, text=True, timeout=20,
+                                  stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+            return (done.stdout or done.stderr or "").strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    top = run(["-h"])
+    if not top:
+        return ""
+    parts = [f"$ python app.py -h\n{top}"]
+    found = re.search(r"\{([a-z0-9_,-]+)\}", top)
+    for sub_name in (found.group(1).split(",") if found else [])[:8]:
+        text = run([sub_name, "-h"])
+        if text:
+            parts.append(f"$ python app.py {sub_name} -h\n{text}")
+    return "\n\n".join(parts)[:3500]
 
 
 def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
@@ -1667,6 +1819,9 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
             break
         if (sandbox / "app.py").exists():
             shutil.copy(sandbox / "app.py", outdir / f"{name}.py")
+        for keep in ("ANSWER_CHECK.txt", "REVIEW_NOTES.md"):
+            if (sandbox / keep).exists():
+                shutil.copy(sandbox / keep, outdir / keep)
         if (sandbox / "test_app.py").exists():
             tests = (sandbox / "test_app.py").read_text(encoding="utf-8")
             (outdir / f"test_{name}.py").write_text(rename_module_in_tests(tests, name), encoding="utf-8")
@@ -1689,11 +1844,14 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
     entry_path = outdir / "app.py"
     entry_code = entry_path.read_text(encoding="utf-8") if entry_path.exists() else ""
     shown = entry_code if len(entry_code) < 5000 else signatures_only(entry_code)
+    helptext = cli_help(outdir)
+    how = (f"\n\nThe program's REAL command-line help (copy this syntax exactly into the "
+           f"usage examples; do not invent options):\n```\n{helptext}\n```") if helptext else ""
     try:
         readme = clean_design(docs.ask(
             f"Requirements:\n{plan_text(plan)}\n\nThe program is made of these files: {files}. "
             f"Run it with `python app.py` and run the tests with `python -m unittest` (they are "
-            f"test_<module>.py files). Describe the files briefly.\n\napp.py:\n```python\n{shown}```",
+            f"test_<module>.py files). Describe the files briefly.{how}\n\napp.py:\n```python\n{shown}```",
             fallbacks=[f"Requirements:\n{plan_text(plan)}\n\nThe program is made of these files: "
                        f"{files}. Run it with `python app.py`; tests: `python -m unittest`."]))
     except (ApiError, requests.RequestException):
@@ -1703,8 +1861,16 @@ def build_project(idea: str, outdir: Path, resume: bool = False) -> bool:
         readme = (f"> **Warning:** this project is not fully resolved"
                   + (f" (modules with problems: {', '.join(bad)})" if bad else "")
                   + ". See last_test_output.txt.\n\n") + readme
+    unresolved = (outdir / "ANSWER_CHECK.txt").exists()
+    if unresolved:
+        readme = ("> **Warning:** an independent check found answers that differ from what the "
+                  "idea and design imply. See ANSWER_CHECK.txt (the examiner can be wrong too; "
+                  "try each by hand).\n\n") + readme
     (outdir / "README.md").write_text(readme, encoding="utf-8")
     git_commit(outdir, "Add README")
+    if unresolved:
+        log("System", f"WARNING: tests pass, but the exact-answer check still disagrees; read "
+                      f"{outdir / 'ANSWER_CHECK.txt'} and try those commands by hand.")
     if ok_modules and tests_ok:
         log("System", f"Done. Project in {outdir} ({len(mods)} modules, all tests pass).")
     else:
@@ -1853,21 +2019,26 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
     commit(outdir, "Initial version")
 
     approved = False
+    verdict = ""
+    last_green = None  # (code, tests) of the latest version whose tests all passed
     review_skipped = False
     last_stress = []  # stress-test problems found in the latest round
     last_output = ""
     stall = 0  # how many fixes in a row left the test output exactly the same
     answer_script, answer_checked, answer_fixes, answer_open = None, None, 0, []
+    after_answer_fix = False  # the last code change was made to satisfy the answer check
     best = None  # (tests passing, code, test_code) for the best version seen so far
     for rnd in range(1, MAX_ROUNDS + 1):
         log("System", f"Round {rnd}/{MAX_ROUNDS}: running tests")
+        was_answer_fix, after_answer_fix = after_answer_fix, False
         ok, output = run_tests(outdir)
         warning = ""
         if not ok:
             score = passed_count(output)
             # A "fix" must never leave things worse than the best version seen so
             # far (compared only while the test file is unchanged).
-            if best and best[2] == test_code and score < best[0] and code != best[1]:
+            if (best and best[2] == test_code and score < best[0] and code != best[1]
+                    and not was_answer_fix):
                 log("System", f"The last change made things worse ({best[0]} -> {score} "
                               f"tests passing); reverting to the best version.")
                 warning = (
@@ -1886,7 +2057,9 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
         test_names, blocks = set(), {}
         if ok:
             best = (passed_count(output), code, test_code)
+            last_green = (code, test_code)
             missing_api = [n for n in required_names if n not in (defined_names(code) or set())]
+            bad_calls = call_problems(code, outdir) if module == "app" else []
             last_stress = [] if missing_api else (stress_test(outdir) if STRESS and not library else [])
             if missing_api:
                 log("System", "Tests pass, but these functions from the plan are missing: "
@@ -1895,6 +2068,16 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
                            "classes, and other modules import them by exactly these names, but "
                            "they are missing: " + ", ".join(missing_api) + ". Add them with the "
                            "exact names and signatures from the design.")
+                code_feedback = verdict
+            elif bad_calls:
+                after_answer_fix = True  # tests that mock the wrong call may need correcting too
+                log("System", "Tests pass, but the program calls other modules wrongly:")
+                for line in bad_calls:
+                    log("CallCheck", line[:200])
+                verdict = ("The program calls functions of the other modules in a way that does "
+                           "not match their real code, so it crashes when run (the tests hide "
+                           "this because they mock those calls):\n- " + "\n- ".join(bad_calls) +
+                           "\n\nFix every call to use the real names and signatures.")
                 code_feedback = verdict
             elif last_stress:
                 log("System", f"Tests passed, but the stress test found {len(last_stress)} "
@@ -1929,6 +2112,7 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
                         log("AnswerCheck", "every expected answer matched")
                 if answer_found and answer_fixes < ANSWER_CHECKS:
                     answer_fixes += 1
+                    after_answer_fix = True
                     log("System", f"{len(answer_found)} wrong answer(s); asking the Developer to fix "
                                   f"them ({answer_fixes}/{ANSWER_CHECKS}).")
                     verdict = (
@@ -1974,6 +2158,13 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
                 # The Developer's fix changed nothing. Either the code cannot satisfy the
                 # test, or the test itself is wrong: let the Tester check it against the design.
                 audit, fix_tests, test_names = True, True, set(blocks)
+            if was_answer_fix and blocks:
+                # The code was just changed on purpose to give the answers the design implies.
+                # Tests that now fail probably still expect the OLD behavior (often the very
+                # mistake being fixed), so do not undo the fix: let the Tester check them.
+                audit, fix_tests, test_names, fix_code = True, True, set(blocks), False
+                log("System", "The answer fix made some tests fail; they may encode the old "
+                              "behavior, so the Tester will check them against the design.")
             log("System", f"Tests failed: {len(blocks)} failing | "
                           f"{len(test_names) if not audit else 0} test-file mistakes"
                           + (" | same failure again: the Tester will check the test against the design"
@@ -2016,8 +2207,14 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
                     f"These tests need attention: {names}\n\n"
                     f"Their failure output:\n{evidence}\n\n"
                     + (
-                    f"The Developer could not make these tests pass in several attempts, so "
-                    f"the TEST may be wrong. Compare each failing test with the design: if "
+                    (f"The program was just changed ON PURPOSE so that it gives the answers "
+                     f"the design implies (an independent examiner confirmed them), and these "
+                     f"tests now fail. They may still expect the old, wrong behavior, for "
+                     f"example mocks that accept arguments in the wrong order or use a wrong "
+                     f"dictionary key or message. " if was_answer_fix else
+                     f"The Developer could not make these tests pass in several attempts, so "
+                     f"the TEST may be wrong. ") +
+                    f"Compare each failing test with the design: if "
                     f"its expected value or behavior is not exactly what the design's rules "
                     f"and worked examples say, correct the test. If a test matches the "
                     f"design, leave it unchanged. Return the full test_app.py."
@@ -2093,6 +2290,15 @@ def build(idea: str, outdir: Path, pause: bool = False, design_file: str = "",
             (outdir / "app.py").write_text(code, encoding="utf-8")
             commit(outdir, f"Fix code, round {rnd}")
 
+    if not ok and last_green and last_green != (code, test_code):
+        log("System", "The final version fails tests that an earlier version passed; "
+                      "restoring that earlier version.")
+        code, test_code = last_green
+        (outdir / "app.py").write_text(code, encoding="utf-8")
+        (outdir / "test_app.py").write_text(test_code, encoding="utf-8")
+        ok, output = run_tests(outdir)
+        (outdir / "last_test_output.txt").write_text(output, encoding="utf-8")
+        last_stress = []
     if module and not approved and ok and not last_stress:
         notes = verdict if isinstance(verdict, str) else ""
         if notes:
